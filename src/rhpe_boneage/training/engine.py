@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from contextlib import nullcontext
 from typing import Any
 
@@ -116,6 +117,17 @@ def _set_progress_postfix(progress, total_loss: float, total_count: int) -> None
         progress.set_postfix(loss="nan")
 
 
+def _log_first_batch_wait(logger, phase: str, epoch: int | None, seconds: float) -> None:
+    if logger is None:
+        return
+    logger.info(
+        "首个 batch 已就绪 | phase=%s | epoch=%s | wait_seconds=%.2f",
+        phase,
+        epoch,
+        seconds,
+    )
+
+
 def run_epoch(
     model: torch.nn.Module,
     loader,
@@ -158,9 +170,23 @@ def run_epoch(
         leave=False,
         disable=not show_progress,
     )
+    first_batch_wait_started = time.perf_counter()
+    if logger is not None and epoch == 1:
+        logger.info(
+            "正在等待首个 batch | phase=%s | epoch=%s | 首次可能因数据预处理、Windows DataLoader worker 启动和 torch.compile 预热而偏慢。",
+            phase,
+            epoch,
+        )
 
     with _inference_context(train):
         for batch_index, batch in enumerate(progress):
+            if batch_index == 0:
+                _log_first_batch_wait(
+                    logger,
+                    phase=phase,
+                    epoch=epoch,
+                    seconds=time.perf_counter() - first_batch_wait_started,
+                )
             batch = move_batch_to_device(batch, device)
             if batch_index == 0:
                 _log_first_batch_device(batch, model, device, logger, phase=phase, epoch=epoch)

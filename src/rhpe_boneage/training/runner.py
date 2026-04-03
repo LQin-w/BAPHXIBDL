@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import math
 from pathlib import Path
 from typing import Any
@@ -45,6 +44,16 @@ def _log_epoch_metrics(
         _safe_metric_value(train_metrics.get("mad")),
         _safe_metric_value(val_metrics.get("mad")),
         lr,
+    )
+
+
+def _log_dataloader_kwargs(logger, loader_kwargs: dict[str, Any]) -> None:
+    logger.info(
+        "DataLoader | num_workers=%s | pin_memory=%s | persistent_workers=%s | prefetch_factor=%s",
+        loader_kwargs.get("num_workers"),
+        loader_kwargs.get("pin_memory"),
+        loader_kwargs.get("persistent_workers"),
+        loader_kwargs.get("prefetch_factor"),
     )
 
 
@@ -92,6 +101,12 @@ def _limit_records(records: list[dict[str, Any]], limit: int) -> list[dict[str, 
     if limit and limit > 0:
         return records[:limit]
     return records
+
+
+def _coerce_optional_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    return int(value)
 
 
 def _build_data_payload(
@@ -181,7 +196,10 @@ def _build_dataloaders(datasets: dict[str, Any], config: dict[str, Any], device:
         }
         if workers > 0:
             default_prefetch = 4 if device.type == "cuda" else 2
-            loader_kwargs["prefetch_factor"] = int(training_cfg.get("prefetch_factor", default_prefetch))
+            loader_kwargs["prefetch_factor"] = _coerce_optional_int(
+                training_cfg.get("prefetch_factor"),
+                default=default_prefetch,
+            )
     else:
         loader_kwargs = suggest_dataloader_kwargs(
             batch_size=int(training_cfg["batch_size"]),
@@ -201,13 +219,6 @@ def _build_dataloaders(datasets: dict[str, Any], config: dict[str, Any], device:
     else:
         loader_kwargs.pop("prefetch_factor", None)
         loader_kwargs["persistent_workers"] = False
-
-    if (
-        device.type == "cuda"
-        and loader_kwargs.get("pin_memory", False)
-        and "pin_memory_device" in inspect.signature(DataLoader.__init__).parameters
-    ):
-        loader_kwargs["pin_memory_device"] = str(device)
 
     dataloaders = {}
     if "train" in datasets:
@@ -393,6 +404,7 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
     datasets, normalizers = _build_datasets(payload, config, checkpoint_state=checkpoint_state)
     dataloaders, loader_kwargs = _build_dataloaders(datasets, config, device)
     write_json(loader_kwargs, run_dir / "dataloader.json")
+    _log_dataloader_kwargs(logger, loader_kwargs)
 
     model = build_model(config).to(device)
     if device.type == "cuda":
@@ -612,6 +624,7 @@ def evaluate_main(
     datasets, normalizers = _build_datasets(payload, config, checkpoint_state=checkpoint_state)
     dataloaders, loader_kwargs = _build_dataloaders(datasets, config, device)
     write_json(loader_kwargs, run_dir / "dataloader.json")
+    _log_dataloader_kwargs(logger, loader_kwargs)
 
     if split not in dataloaders:
         raise ValueError(f"请求评估的 split 不存在: {split}")
@@ -701,7 +714,8 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
         payload, reports = _build_data_payload(trial_config, run_dir)
         _log_reports(logger_trial, reports)
         datasets, normalizers = _build_datasets(payload, trial_config, checkpoint_state=None)
-        dataloaders, _ = _build_dataloaders(datasets, trial_config, device)
+        dataloaders, loader_kwargs = _build_dataloaders(datasets, trial_config, device)
+        _log_dataloader_kwargs(logger_trial, loader_kwargs)
         model = build_model(trial_config).to(device)
         if device.type == "cuda":
             model = model.to(memory_format=torch.channels_last)

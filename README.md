@@ -333,6 +333,14 @@ python -m pip install -r requirements.txt
 
 ## 18. 训练命令
 
+图形界面参数面板（训练前可视化选择每个参数）：
+
+```bash
+python scripts/train_ui.py --config configs/default.yaml
+```
+
+界面会把配置文件中的每个可调叶子参数渲染为下拉选择框（可直接选择，也可手动输入），点击“开始训练”后按当前选择启动训练。
+
 标准训练：
 
 ```bash

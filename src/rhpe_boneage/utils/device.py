@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, asdict
 from typing import Any
 
@@ -109,21 +110,24 @@ def suggest_dataloader_kwargs(
 ) -> dict[str, Any]:
     if cpu_count is None:
         cpu_count = 0
-        try:
-            import os
-
-            cpu_count = os.cpu_count() or 0
-        except Exception:
-            cpu_count = 0
+        cpu_count = os.cpu_count() or 0
 
     if cpu_count <= 2:
         workers = 0
-    elif cpu_count <= 4:
-        workers = 2
-    elif cpu_count <= 8:
-        workers = min(4, max(2, cpu_count // 2))
     else:
-        workers = min(12, max(4, cpu_count // 2))
+        # Windows uses spawn for DataLoader workers, so aggressive worker counts
+        # can make the first batch look frozen for a long time.
+        if sys.platform.startswith("win"):
+            if cpu_count <= 8:
+                workers = 2
+            else:
+                workers = min(4, max(2, cpu_count // 4))
+        elif cpu_count <= 4:
+            workers = 2
+        elif cpu_count <= 8:
+            workers = min(4, max(2, cpu_count // 2))
+        else:
+            workers = min(12, max(4, cpu_count // 2))
     if workers > 0:
         workers = min(workers, max(2, batch_size * 2))
 
