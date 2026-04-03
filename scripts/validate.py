@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from _bootstrap import bootstrap
+from _bootstrap import bootstrap, run_cli
 
 
 def main() -> None:
@@ -23,4 +23,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_cli(main)
