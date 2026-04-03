@@ -17,7 +17,7 @@ from ..models import build_model
 from ..utils import detect_runtime, ensure_dir, seed_everything, setup_logger, suggest_dataloader_kwargs, write_json
 from ..utils.device import log_device_probe, maybe_compile_model
 from ..utils.io import timestamp
-from ..utils.plots import plot_history
+from ..utils.plots import generate_training_report
 from .engine import run_epoch, unwrap_model
 from .losses import build_loss
 from .normalization import ScalarNormalizer
@@ -25,6 +25,15 @@ from .normalization import ScalarNormalizer
 
 def _safe_metric_value(value: float | None) -> float:
     return value if value is not None else math.nan
+
+
+def _validate_best_metric(metric_name: str) -> str:
+    allowed = {"loss", "mae", "mad"}
+    normalized = str(metric_name).strip().lower()
+    if normalized not in allowed:
+        allowed_text = ", ".join(sorted(allowed))
+        raise ValueError(f"training.best_metric 仅支持: {allowed_text}")
+    return normalized
 
 
 def _log_epoch_metrics(
@@ -432,7 +441,7 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
 
     save_config(config, run_dir / "config.yaml")
     history_rows = []
-    best_metric_name = config["training"]["best_metric"]
+    best_metric_name = _validate_best_metric(config["training"]["best_metric"])
     best_checkpoint_path = run_dir / "best_model.pt"
     last_checkpoint_path = run_dir / "last_checkpoint.pt"
 
@@ -532,7 +541,6 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
         )
 
     history_df = pd.DataFrame(history_rows)
-    plot_history(history_df, run_dir / "curves.png")
 
     best_state = _load_checkpoint_state(best_checkpoint_path)
     unwrap_model(model).load_state_dict(best_state["model"])
@@ -561,6 +569,8 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
         "last_checkpoint": str(last_checkpoint_path),
         "val_metrics": val_metrics,
     }
+    test_metrics = None
+    test_predictions = None
     if "test" in dataloaders:
         test_metrics, test_predictions = run_epoch(
             model=model,
@@ -581,6 +591,25 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
         test_predictions.to_csv(run_dir / "test_predictions.csv", index=False)
         write_json(test_metrics, run_dir / "test_metrics.json")
         output["test_metrics"] = test_metrics
+
+    try:
+        report_summary = generate_training_report(
+            output_dir=run_dir,
+            history_df=history_df,
+            val_predictions=val_predictions,
+            test_predictions=test_predictions,
+            val_metrics=val_metrics,
+            test_metrics=test_metrics,
+            config=config,
+            runtime=runtime.to_dict(),
+            best_metric_name=best_metric_name,
+            best_checkpoint_path=best_checkpoint_path,
+            last_checkpoint_path=last_checkpoint_path,
+        )
+        output["best_summary"] = report_summary
+    except Exception as exc:
+        logger.exception("论文结果文件生成失败。")
+        raise RuntimeError(f"训练已完成，但论文结果文件生成失败: {exc}") from exc
     return output
 
 

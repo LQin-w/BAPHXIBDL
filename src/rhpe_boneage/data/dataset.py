@@ -158,7 +158,12 @@ class RHPEBoneAgeDataset(Dataset):
         self.patch_size = int(config["data"]["local_patch_size"])
         self.max_keypoints = int(config["data"]["max_keypoints"])
         self.input_size = int(config["data"]["input_size"])
-        self.global_crop_mode = config["data"].get("global_crop_mode", "bbox")
+        crop_mode = str(config["data"].get("global_crop_mode", "bbox")).strip().lower()
+        if crop_mode in {"none", "image"}:
+            crop_mode = "full"
+        if crop_mode not in {"bbox", "full"}:
+            raise ValueError(f"不支持的 data.global_crop_mode: {crop_mode}，仅支持 bbox 或 full。")
+        self.global_crop_mode = crop_mode
         self.global_crop_margin_ratio = float(config["data"].get("global_crop_margin_ratio", 0.05))
 
     def __len__(self) -> int:

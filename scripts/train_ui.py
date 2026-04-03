@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import threading
 import tkinter as tk
 from collections import OrderedDict
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
 
 import yaml
@@ -19,6 +20,7 @@ except ModuleNotFoundError:
 
 PRESET_OPTIONS: dict[str, list[str]] = {
     "runtime.device": ["cuda:0", "cuda:1", "cpu"],
+    "data.global_crop_mode": ["bbox", "full"],
     "model.ensemble_mode": ["ensemble", "resnet", "efficientnet"],
     "model.resnet_name": ["resnet18", "resnet34", "resnet50"],
     "model.efficientnet_name": ["efficientnet_b0", "efficientnet_b1", "efficientnet_b2"],
@@ -30,7 +32,29 @@ PRESET_OPTIONS: dict[str, list[str]] = {
     "training.optimizer": ["adamw", "adam", "sgd"],
     "training.scheduler": ["plateau", "cosine", "none"],
     "training.loss": ["smoothl1", "l1", "mse"],
+    "training.best_metric": ["mae", "mad", "loss"],
+    "optuna.direction": ["minimize", "maximize"],
 }
+
+STRICT_OPTIONS: dict[str, set[str]] = {
+    "data.global_crop_mode": {"bbox", "full", "none", "image"},
+    "model.ensemble_mode": {"ensemble", "resnet", "efficientnet"},
+    "model.resnet_name": {"resnet18", "resnet34", "resnet50"},
+    "model.efficientnet_name": {"efficientnet_b0", "efficientnet_b1", "efficientnet_b2"},
+    "model.branch_mode": {"global_local", "global_only", "local_only"},
+    "model.target_mode": {"relative", "direct"},
+    "model.relative_target_direction": {"boneage_minus_chronological", "chronological_minus_boneage"},
+    "model.metadata.mode": {"simba_hybrid", "simba_multiplier", "mlp"},
+    "model.local_branch.mode": {"patch_heatmap", "patch", "heatmap"},
+    "training.optimizer": {"adamw", "adam", "sgd"},
+    "training.scheduler": {"plateau", "cosine", "none"},
+    "training.loss": {"smoothl1", "l1", "mse"},
+    "training.best_metric": {"mae", "mad", "loss"},
+    "optuna.direction": {"minimize", "maximize"},
+}
+
+HIDDEN_UI_PREFIXES: tuple[str, ...] = ("optuna.",)
+DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
 
 OPTION_META: dict[str, tuple[str, str]] = {
     "experiment.name": ("实验名称", "本次实验的名称前缀，用于输出目录与日志标识。"),
@@ -138,6 +162,49 @@ def _flatten_config(config: dict[str, Any], prefix: str = "") -> OrderedDict[str
     return flat
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _load_yaml_dict(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise TypeError(f"配置文件顶层必须是字典: {path}")
+    return data
+
+
+def _build_train_ui_config(config_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    merged_config: dict[str, Any] = {}
+    if DEFAULT_SCHEMA_PATH.exists():
+        merged_config = _deep_merge(merged_config, _load_yaml_dict(DEFAULT_SCHEMA_PATH))
+    selected_config = _load_yaml_dict(config_path)
+    merged_config = _deep_merge(merged_config, selected_config)
+    return merged_config, selected_config
+
+
+def _assign_nested_value(config: dict[str, Any], dotted_key: str, value: Any) -> None:
+    current = config
+    keys = dotted_key.split(".")
+    for key in keys[:-1]:
+        child = current.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            current[key] = child
+        current = child
+    current[keys[-1]] = value
+
+
+def _is_visible_in_train_ui(dotted_key: str) -> bool:
+    return not any(dotted_key.startswith(prefix) for prefix in HIDDEN_UI_PREFIXES)
+
+
 def _to_display_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -221,16 +288,28 @@ def _get_option_meta(path: str) -> tuple[str, str]:
     return cn_name, cn_desc
 
 
+def _validate_ui_value(dotted_key: str, value: Any) -> None:
+    allowed = STRICT_OPTIONS.get(dotted_key)
+    if allowed is None:
+        return
+    normalized = str(value).strip().lower()
+    if normalized in allowed:
+        return
+    allowed_text = ", ".join(sorted(allowed))
+    raise ValueError(f"{dotted_key} 仅支持以下取值: {allowed_text}")
+
+
 class TrainUI:
     def __init__(self, root: tk.Tk, config_path: str) -> None:
         self.root = root
         self.root.title("RHPE BoneAge Training UI")
-        self.root.geometry("1360x820")
+        self.root.geometry("907x820")
 
         self.config_path_var = tk.StringVar(value=config_path)
         self.status_var = tk.StringVar(value="就绪")
         self.widgets: dict[str, ttk.Combobox] = {}
         self.base_flat: OrderedDict[str, Any] = OrderedDict()
+        self.loaded_config: dict[str, Any] = {}
         self.running = False
 
         self._build_layout()
@@ -245,6 +324,7 @@ class TrainUI:
         config_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
 
         ttk.Button(top, text="选择文件", command=self._choose_config).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(top, text="保存配置", command=self._save_current_config).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(top, text="重新加载", command=self._reload_current_config).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(top, text="选择续训点", command=self._choose_resume_checkpoint).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(top, text="清空续训", command=self._clear_resume_checkpoint).pack(side=tk.LEFT)
@@ -341,23 +421,86 @@ class TrainUI:
             child.destroy()
         self.widgets.clear()
 
+    def _collect_current_config(self) -> dict[str, Any]:
+        current_config = copy.deepcopy(self.loaded_config)
+        for dotted_key, base_value in self.base_flat.items():
+            widget = self.widgets.get(dotted_key)
+            if widget is None:
+                continue
+            current_raw = widget.get()
+            if current_raw.strip() == "":
+                parsed_value = base_value
+            else:
+                parsed_value = _parse_value(current_raw)
+                if parsed_value is None and base_value is not None:
+                    raise ValueError(f"{dotted_key} 不能设置为 null，请填写有效值或恢复默认值。")
+                _validate_ui_value(dotted_key, parsed_value)
+            _assign_nested_value(current_config, dotted_key, parsed_value)
+        return current_config
+
+    def _save_current_config(self) -> None:
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showerror("保存失败", "当前没有可保存的配置文件路径。")
+            return
+        current_path = Path(config_path)
+        default_name = current_path.name or "config.yaml"
+        file_name = simpledialog.askstring(
+            "重命名配置文件",
+            "请输入保存文件名：",
+            parent=self.root,
+            initialvalue=default_name,
+        )
+        if file_name is None:
+            self.status_var.set("已取消保存配置。")
+            return
+        normalized_name = file_name.strip()
+        if not normalized_name:
+            messagebox.showerror("保存失败", "文件名不能为空。")
+            return
+        path = current_path.parent / normalized_name
+        if path.suffix.lower() not in {".yaml", ".yml"}:
+            path = path.with_suffix(".yaml")
+        try:
+            config_to_save = self._collect_current_config()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(config_to_save, handle, allow_unicode=True, sort_keys=False)
+        except ValueError as exc:
+            messagebox.showerror("配置错误", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("保存失败", f"无法保存配置文件:\n{exc}")
+            return
+        self.config_path_var.set(str(path))
+        self._load_config_into_form(str(path))
+        self.status_var.set(f"配置已保存到: {path}")
+
     def _load_config_into_form(self, config_path: str) -> None:
         path = Path(config_path)
         if not path.exists():
             messagebox.showerror("配置文件不存在", f"找不到配置文件: {path}")
             return
         try:
-            with path.open("r", encoding="utf-8") as handle:
-                config = yaml.safe_load(handle) or {}
+            merged_config, selected_config = _build_train_ui_config(path)
         except Exception as exc:
             messagebox.showerror("读取失败", f"无法读取配置文件:\n{exc}")
             return
-        if not isinstance(config, dict):
-            messagebox.showerror("配置错误", "配置文件顶层必须是字典。")
-            return
 
         self._clear_form()
-        self.base_flat = _flatten_config(config)
+        self.loaded_config = copy.deepcopy(merged_config)
+        merged_flat = _flatten_config(merged_config)
+        selected_flat = _flatten_config(selected_config)
+        hidden_count = 0
+        added_from_default = 0
+        self.base_flat = OrderedDict()
+        for dotted_key, value in merged_flat.items():
+            if not _is_visible_in_train_ui(dotted_key):
+                hidden_count += 1
+                continue
+            if dotted_key not in selected_flat:
+                added_from_default += 1
+            self.base_flat[dotted_key] = value
 
         headers = ["配置路径", "中文名称", "参数取值", "参数释义"]
         for index, header in enumerate(headers):
@@ -391,7 +534,9 @@ class TrainUI:
         self.form_frame.columnconfigure(1, weight=2)
         self.form_frame.columnconfigure(2, weight=1)
         self.form_frame.columnconfigure(3, weight=4)
-        self.status_var.set(f"已加载 {len(self.base_flat)} 个参数，并显示中文名称与释义。")
+        self.status_var.set(
+            f"已加载 {len(self.base_flat)} 个训练参数，补全 {added_from_default} 个默认参数，隐藏 {hidden_count} 个当前训练模式不生效的参数。"
+        )
 
     def _reset_to_defaults(self) -> None:
         for dotted_key, value in self.base_flat.items():
@@ -414,6 +559,7 @@ class TrainUI:
             parsed_value = _parse_value(current_raw)
             if parsed_value is None and base_value is not None:
                 raise ValueError(f"{dotted_key} 不能设置为 null，请填写有效值或恢复默认值。")
+            _validate_ui_value(dotted_key, parsed_value)
             if parsed_value != base_value:
                 overrides.append(f"{dotted_key}={_scalar_to_override(parsed_value)}")
         return overrides
@@ -476,7 +622,7 @@ def main() -> None:
 
     root = tk.Tk()
     TrainUI(root=root, config_path=args.config)
-    root.minsize(1120, 620)
+    root.minsize(747, 620)
     root.mainloop()
 
 
