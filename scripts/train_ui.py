@@ -245,7 +245,9 @@ class TrainUI:
         config_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
 
         ttk.Button(top, text="选择文件", command=self._choose_config).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(top, text="重新加载", command=self._reload_current_config).pack(side=tk.LEFT)
+        ttk.Button(top, text="重新加载", command=self._reload_current_config).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(top, text="选择续训点", command=self._choose_resume_checkpoint).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(top, text="清空续训", command=self._clear_resume_checkpoint).pack(side=tk.LEFT)
 
         body = ttk.Frame(self.root, padding=(10, 0, 10, 0))
         body.pack(fill=tk.BOTH, expand=True)
@@ -284,6 +286,55 @@ class TrainUI:
 
     def _reload_current_config(self) -> None:
         self._load_config_into_form(self.config_path_var.get().strip())
+
+    def _set_field_value(self, dotted_key: str, value: str) -> None:
+        widget = self.widgets.get(dotted_key)
+        if widget is None:
+            raise KeyError(f"表单中不存在配置项: {dotted_key}")
+        widget.set(value)
+
+    def _choose_resume_checkpoint(self) -> None:
+        initial_value = ""
+        widget = self.widgets.get("training.resume_checkpoint")
+        if widget is not None:
+            current_value = widget.get().strip()
+            if current_value and current_value.lower() != "null":
+                initial_value = current_value
+        initial_dir = ""
+        initial_file = ""
+        if initial_value:
+            candidate = Path(initial_value)
+            if candidate.is_file():
+                initial_dir = str(candidate.parent)
+                initial_file = candidate.name
+        if not initial_dir:
+            initial_dir = str(Path("outputs").resolve())
+
+        selected = filedialog.askopenfilename(
+            title="选择续训 checkpoint",
+            initialdir=initial_dir,
+            initialfile=initial_file,
+            filetypes=[
+                ("PyTorch checkpoints", "*.pt *.pth *.ckpt"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not selected:
+            return
+        try:
+            self._set_field_value("training.resume_checkpoint", selected)
+        except KeyError as exc:
+            messagebox.showerror("配置错误", str(exc))
+            return
+        self.status_var.set(f"已选择续训 checkpoint: {selected}")
+
+    def _clear_resume_checkpoint(self) -> None:
+        try:
+            self._set_field_value("training.resume_checkpoint", "null")
+        except KeyError as exc:
+            messagebox.showerror("配置错误", str(exc))
+            return
+        self.status_var.set("已清空续训 checkpoint，将从头开始训练。")
 
     def _clear_form(self) -> None:
         for child in self.form_frame.winfo_children():
