@@ -192,6 +192,8 @@ class RHPEBoneAgeDataset(Dataset):
         self.patch_size = int(config["data"]["local_patch_size"])
         self.max_keypoints = int(config["data"]["max_keypoints"])
         self.input_size = int(config["data"]["input_size"])
+        self.heatmap_sigma_ratio = float(config["data"].get("heatmap_sigma_ratio", 0.035))
+        self.heatmap_sigma_min = max(0.0, float(config["data"].get("heatmap_sigma_min", 8.0)))
         crop_mode = str(config["data"].get("global_crop_mode", "bbox")).strip().lower()
         if crop_mode in {"none", "image"}:
             crop_mode = "full"
@@ -288,12 +290,12 @@ class RHPEBoneAgeDataset(Dataset):
                 bbox=bbox,
                 margin_ratio=self.global_crop_margin_ratio,
             )
-        sigma = max(bbox[2], bbox[3]) * float(self.config["data"]["heatmap_sigma_ratio"])
+        sigma = max(bbox[2], bbox[3]) * self.heatmap_sigma_ratio
         heatmap = generate_heatmap(
             image.shape[0],
             image.shape[1],
             keypoints_arr.tolist(),
-            sigma=max(sigma, 6.0),
+            sigma=max(sigma, self.heatmap_sigma_min),
         )
         try:
             image, heatmap, keypoints_arr, bbox = self._transform_roi(

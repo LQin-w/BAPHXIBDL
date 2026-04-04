@@ -16,6 +16,7 @@ data:
   local_patch_size: 96
   max_keypoints: 17
   heatmap_sigma_ratio: 0.035
+  heatmap_sigma_min: 8.0
   global_crop_mode: bbox
   global_crop_margin_ratio: 0.08
   verify_images: false
