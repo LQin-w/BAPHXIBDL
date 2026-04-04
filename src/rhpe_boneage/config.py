@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "default.yaml"
+_SCIENTIFIC_NOTATION_PATTERN = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))[eE][+-]?\d+$")
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -42,6 +44,16 @@ def _assign_nested(config: dict[str, Any], dotted_key: str, value: Any) -> None:
     current[parts[-1]] = value
 
 
+def _parse_scalar_override(raw_value: str) -> Any:
+    text = raw_value.strip()
+    if text == "":
+        return None
+    value = yaml.safe_load(text)
+    if isinstance(value, str) and _SCIENTIFIC_NOTATION_PATTERN.fullmatch(text):
+        return float(text)
+    return value
+
+
 def parse_overrides(overrides: list[str] | None) -> dict[str, Any]:
     parsed: dict[str, Any] = {}
     if not overrides:
@@ -50,7 +62,7 @@ def parse_overrides(overrides: list[str] | None) -> dict[str, Any]:
         if "=" not in item:
             raise ValueError(f"覆盖参数格式必须是 key=value，收到: {item}")
         key, raw_value = item.split("=", 1)
-        value = yaml.safe_load(raw_value)
+        value = _parse_scalar_override(raw_value)
         _assign_nested(parsed, key.strip(), value)
     return parsed
 

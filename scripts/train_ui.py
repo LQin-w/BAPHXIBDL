@@ -6,6 +6,7 @@ import json
 import logging
 import platform
 import queue
+import re
 import sys
 import threading
 import traceback
@@ -68,6 +69,7 @@ STRICT_OPTIONS: dict[str, set[str]] = {
 
 HIDDEN_UI_PREFIXES: tuple[str, ...] = ("optuna.",)
 DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
+_SCIENTIFIC_NOTATION_PATTERN = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))[eE][+-]?\d+$")
 FONT_CANDIDATES_UI: tuple[str, ...] = (
     "Noto Sans CJK SC",
     "Noto Serif CJK SC",
@@ -184,9 +186,20 @@ def _parse_value(raw: str) -> Any:
     if text == "":
         return None
     try:
-        return yaml.safe_load(text)
+        value = yaml.safe_load(text)
     except Exception:
+        if _SCIENTIFIC_NOTATION_PATTERN.fullmatch(text):
+            try:
+                return float(text)
+            except ValueError:
+                pass
         return text
+    if isinstance(value, str) and _SCIENTIFIC_NOTATION_PATTERN.fullmatch(text):
+        try:
+            return float(text)
+        except ValueError:
+            pass
+    return value
 
 
 def _float_suggestions(value: float) -> list[str]:

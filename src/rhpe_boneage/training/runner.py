@@ -1038,7 +1038,9 @@ def _build_optimizer(model: torch.nn.Module, config: dict[str, Any]):
         params.append({"params": decay_params, "weight_decay": float(training_cfg["weight_decay"])})
     if no_decay_params:
         params.append({"params": no_decay_params, "weight_decay": 0.0})
-    name = training_cfg["optimizer"].lower()
+    name = str(training_cfg["optimizer"]).lower()
+    lr = float(training_cfg["lr"])
+    momentum = float(training_cfg["momentum"])
     use_fused = bool(torch.cuda.is_available()) and all(
         param.device.type == "cuda"
         for group in params
@@ -1054,14 +1056,14 @@ def _build_optimizer(model: torch.nn.Module, config: dict[str, Any]):
         return optimizer_cls(params, **kwargs)
 
     if name == "adam":
-        return _try_build(torch.optim.Adam, lr=training_cfg["lr"])
+        return _try_build(torch.optim.Adam, lr=lr)
     if name == "adamw":
-        return _try_build(torch.optim.AdamW, lr=training_cfg["lr"])
+        return _try_build(torch.optim.AdamW, lr=lr)
     if name == "sgd":
         return torch.optim.SGD(
             params,
-            lr=training_cfg["lr"],
-            momentum=training_cfg["momentum"],
+            lr=lr,
+            momentum=momentum,
             nesterov=True,
         )
     raise ValueError(f"不支持的优化器: {training_cfg['optimizer']}")
@@ -1069,7 +1071,8 @@ def _build_optimizer(model: torch.nn.Module, config: dict[str, Any]):
 
 def _build_scheduler(optimizer, config: dict[str, Any]):
     training_cfg = config["training"]
-    name = training_cfg["scheduler"].lower()
+    name = str(training_cfg["scheduler"]).lower()
+    min_lr = float(training_cfg["min_lr"])
     warmup_epochs, _ = _resolve_warmup_settings(config, int(training_cfg["epochs"]))
     if name == "plateau":
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1077,13 +1080,13 @@ def _build_scheduler(optimizer, config: dict[str, Any]):
             mode="min",
             factor=0.5,
             patience=2,
-            min_lr=training_cfg["min_lr"],
+            min_lr=min_lr,
         )
     if name == "cosine":
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=max(1, int(training_cfg["epochs"]) - warmup_epochs),
-            eta_min=training_cfg["min_lr"],
+            eta_min=min_lr,
         )
     if name == "none":
         return None
