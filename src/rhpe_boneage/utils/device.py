@@ -284,6 +284,23 @@ def _cuda_compile_is_available() -> bool:
         return False
 
 
+def _compile_mode_options(mode: str) -> dict[str, Any]:
+    if not hasattr(torch, "_inductor") or not hasattr(torch._inductor, "list_mode_options"):
+        return {}
+    try:
+        options = torch._inductor.list_mode_options().get(mode, {})
+    except Exception:
+        return {}
+    return dict(options)
+
+
+def _has_multi_backbone_ensemble(model: torch.nn.Module) -> bool:
+    return bool(
+        getattr(model, "resnet", None) is not None
+        and getattr(model, "efficientnet", None) is not None
+    )
+
+
 def maybe_compile_model(
     model: torch.nn.Module,
     enabled: bool,
@@ -301,12 +318,22 @@ def maybe_compile_model(
         logger.warning("torch.compile: 当前 CUDA 环境缺少可用 Triton，自动降级。")
         return model
     try:
-        compile_kwargs: dict[str, Any] = {}
         normalized_mode = (mode or "default").strip().lower()
-        if normalized_mode and normalized_mode != "default":
+        mode_options = _compile_mode_options(normalized_mode)
+        compile_kwargs: dict[str, Any] = {}
+        cudagraphs_enabled = bool(mode_options.get("triton.cudagraphs", False))
+        if model_device.type == "cuda" and _has_multi_backbone_ensemble(model):
+            safe_options = dict(mode_options)
+            safe_options["triton.cudagraphs"] = False
+            compile_kwargs["options"] = safe_options
+            cudagraphs_enabled = False
+            logger.warning(
+                "torch.compile: 检测到双-backbone ensemble，已自动禁用 CUDAGraphs，以规避顺序分支前向时的输出覆盖问题。"
+            )
+        elif normalized_mode and normalized_mode != "default":
             compile_kwargs["mode"] = normalized_mode
         compiled = torch.compile(model, **compile_kwargs)
-        logger.info("torch.compile: 已启用 | mode=%s", normalized_mode)
+        logger.info("torch.compile: 已启用 | mode=%s | cudagraphs=%s", normalized_mode, cudagraphs_enabled)
         return compiled
     except Exception as exc:  # pragma: no cover - 编译失败时的保护逻辑
         logger.warning("torch.compile: 启用失败，自动降级。原因: %s", exc)

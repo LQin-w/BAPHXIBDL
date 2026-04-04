@@ -142,6 +142,17 @@ def _inference_context(train: bool):
     return torch.inference_mode()
 
 
+def _mark_cudagraph_step_begin(model: torch.nn.Module, device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    if not hasattr(model, "_orig_mod"):
+        return
+    compiler = getattr(torch, "compiler", None)
+    if compiler is None or not hasattr(compiler, "cudagraph_mark_step_begin"):
+        return
+    compiler.cudagraph_mark_step_begin()
+
+
 def _set_progress_postfix(progress, total_loss: float, total_count: int) -> None:
     if progress is None:
         return
@@ -349,6 +360,7 @@ def run_epoch(
                 has_target_mask = batch["has_target"].view(-1).bool()
                 compute_started = time.perf_counter()
 
+                _mark_cudagraph_step_begin(model, device)
                 with _autocast_context(device, amp_enabled):
                     outputs = model(batch)
                     prediction = outputs["prediction"]

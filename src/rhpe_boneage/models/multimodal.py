@@ -221,11 +221,13 @@ class EnsembleBoneAgeModel(nn.Module):
         predictions = []
         outputs = {}
         if self.resnet is not None:
-            resnet_output = self.resnet(batch)["prediction"]
+            # Clone tiny prediction tensors so sequential compiled submodel calls
+            # do not alias the same CUDA Graph-managed output buffer.
+            resnet_output = self.resnet(batch)["prediction"].clone()
             outputs["resnet_prediction"] = resnet_output
             predictions.append(resnet_output)
         if self.efficientnet is not None:
-            efficientnet_output = self.efficientnet(batch)["prediction"]
+            efficientnet_output = self.efficientnet(batch)["prediction"].clone()
             outputs["efficientnet_prediction"] = efficientnet_output
             predictions.append(efficientnet_output)
 
