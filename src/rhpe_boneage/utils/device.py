@@ -19,6 +19,7 @@ class RuntimeInfo:
     device_names: list[str]
     requested_device: str
     selected_device: str
+    deterministic: bool
     cudnn_benchmark: bool
     tf32_matmul: bool
     tf32_cudnn: bool
@@ -42,6 +43,7 @@ def _normalize_requested_device(requested_device: str | None) -> str:
 def detect_runtime(
     requested_device: str | None = None,
     allow_cpu_fallback: bool = False,
+    deterministic: bool = False,
 ) -> tuple[torch.device, RuntimeInfo]:
     normalized_device = _normalize_requested_device(requested_device)
     cuda_available = torch.cuda.is_available()
@@ -73,7 +75,8 @@ def detect_runtime(
     matmul_precision = "default"
     if device.type == "cuda":
         if hasattr(torch.backends, "cudnn"):
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = bool(deterministic)
+            torch.backends.cudnn.benchmark = not bool(deterministic)
             cudnn_benchmark = bool(torch.backends.cudnn.benchmark)
             if hasattr(torch.backends.cudnn, "allow_tf32"):
                 torch.backends.cudnn.allow_tf32 = True
@@ -95,6 +98,7 @@ def detect_runtime(
         device_names=names,
         requested_device=normalized_device,
         selected_device=str(device),
+        deterministic=bool(deterministic),
         cudnn_benchmark=cudnn_benchmark,
         tf32_matmul=tf32_matmul,
         tf32_cudnn=tf32_cudnn,
@@ -115,21 +119,21 @@ def suggest_dataloader_kwargs(
     if cpu_count <= 2:
         workers = 0
     else:
-        # Windows uses spawn for DataLoader workers, so aggressive worker counts
-        # can make the first batch look frozen for a long time.
         if sys.platform.startswith("win"):
             if cpu_count <= 8:
-                workers = 2
+                workers = 1
             else:
-                workers = min(4, max(2, cpu_count // 4))
+                workers = min(2, max(1, cpu_count // 4))
         elif cpu_count <= 4:
-            workers = 2
+            workers = 1
         elif cpu_count <= 8:
-            workers = min(4, max(2, cpu_count // 2))
+            workers = 2
+        elif cpu_count <= 16:
+            workers = 3
         else:
-            workers = min(12, max(4, cpu_count // 2))
+            workers = min(6, max(4, cpu_count // 4))
     if workers > 0:
-        workers = min(workers, max(2, batch_size * 2))
+        workers = min(workers, max(1, batch_size))
 
     kwargs: dict[str, Any] = {
         "num_workers": workers,
@@ -137,7 +141,7 @@ def suggest_dataloader_kwargs(
         "persistent_workers": workers > 0,
     }
     if workers > 0:
-        kwargs["prefetch_factor"] = 4 if use_cuda else 2
+        kwargs["prefetch_factor"] = 2
     return kwargs
 
 
@@ -157,7 +161,12 @@ def _cuda_compile_is_available() -> bool:
         return False
 
 
-def maybe_compile_model(model: torch.nn.Module, enabled: bool, logger) -> torch.nn.Module:
+def maybe_compile_model(
+    model: torch.nn.Module,
+    enabled: bool,
+    logger,
+    mode: str | None = None,
+) -> torch.nn.Module:
     if not enabled:
         logger.info("torch.compile: 配置关闭，跳过。")
         return model
@@ -169,12 +178,28 @@ def maybe_compile_model(model: torch.nn.Module, enabled: bool, logger) -> torch.
         logger.warning("torch.compile: 当前 CUDA 环境缺少可用 Triton，自动降级。")
         return model
     try:
-        compiled = torch.compile(model)
-        logger.info("torch.compile: 已启用。")
+        compile_kwargs: dict[str, Any] = {}
+        normalized_mode = (mode or "default").strip().lower()
+        if normalized_mode and normalized_mode != "default":
+            compile_kwargs["mode"] = normalized_mode
+        compiled = torch.compile(model, **compile_kwargs)
+        logger.info("torch.compile: 已启用 | mode=%s", normalized_mode)
         return compiled
     except Exception as exc:  # pragma: no cover - 编译失败时的保护逻辑
         logger.warning("torch.compile: 启用失败，自动降级。原因: %s", exc)
         return model
+
+
+def get_cuda_memory_snapshot(device: torch.device) -> dict[str, float] | None:
+    if device.type != "cuda":
+        return None
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    return {
+        "allocated_mb": torch.cuda.memory_allocated(device_index) / (1024**2),
+        "reserved_mb": torch.cuda.memory_reserved(device_index) / (1024**2),
+        "max_allocated_mb": torch.cuda.max_memory_allocated(device_index) / (1024**2),
+        "max_reserved_mb": torch.cuda.max_memory_reserved(device_index) / (1024**2),
+    }
 
 
 def log_device_probe(model: torch.nn.Module, device: torch.device, logger) -> None:

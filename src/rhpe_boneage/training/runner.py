@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import cv2
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -56,11 +57,120 @@ def _format_lr(value: float | None) -> str:
     return f"{value:.6g}"
 
 
+def _format_memory(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.1f}MB"
+
+
 def _resolve_log_interval(config: dict[str, Any]) -> int:
     raw_value = (config.get("training") or {}).get("log_interval", 20)
     if raw_value is None:
         return 20
     return max(0, int(raw_value))
+
+
+def _resolve_positive_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    return max(1, int(value))
+
+
+def _resolve_non_negative_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    return max(0, int(value))
+
+
+def _resolve_non_negative_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    return max(0.0, float(value))
+
+
+def _resolve_gradient_accumulation_steps(config: dict[str, Any]) -> int:
+    return _resolve_positive_int((config.get("training") or {}).get("gradient_accumulation_steps"), default=1)
+
+
+def _resolve_eval_interval(config: dict[str, Any], scheduler_name: str, logger) -> int:
+    interval = _resolve_positive_int((config.get("training") or {}).get("eval_interval"), default=1)
+    if scheduler_name == "plateau" and interval != 1:
+        logger.warning("ReduceLROnPlateau 需要每次验证指标，已将 training.eval_interval 从 %s 自动改为 1。", interval)
+        return 1
+    return interval
+
+
+def _resolve_save_interval(config: dict[str, Any]) -> int:
+    return _resolve_positive_int((config.get("training") or {}).get("save_interval"), default=1)
+
+
+def _resolve_warmup_settings(config: dict[str, Any], total_epochs: int) -> tuple[int, float]:
+    training_cfg = config.get("training") or {}
+    warmup_epochs = min(
+        max(total_epochs - 1, 0),
+        _resolve_non_negative_int(training_cfg.get("warmup_epochs"), default=0),
+    )
+    warmup_start_factor = float(training_cfg.get("warmup_start_factor", 0.2) or 0.2)
+    warmup_start_factor = min(max(warmup_start_factor, 1e-4), 1.0)
+    return warmup_epochs, warmup_start_factor
+
+
+def _resolve_early_stopping(config: dict[str, Any]) -> tuple[int, float]:
+    training_cfg = config.get("training") or {}
+    patience = _resolve_non_negative_int(training_cfg.get("early_stopping_patience"), default=0)
+    min_delta = _resolve_non_negative_float(training_cfg.get("early_stopping_min_delta"), default=0.0)
+    return patience, min_delta
+
+
+def _should_run_validation(epoch: int, total_epochs: int, eval_interval: int) -> bool:
+    return epoch == total_epochs or (epoch % eval_interval == 0)
+
+
+def _should_save_checkpoint(epoch: int, total_epochs: int, save_interval: int) -> bool:
+    return epoch == total_epochs or (epoch % save_interval == 0)
+
+
+def _metric_improved(
+    current: float | None,
+    best: float | None,
+    min_delta: float,
+) -> bool:
+    if current is None:
+        return False
+    if best is None:
+        return True
+    return current < (best - min_delta)
+
+
+def _set_optimizer_lr(optimizer, lr_value: float) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr_value
+
+
+def _warmup_lr(base_lr: float, next_epoch: int, warmup_epochs: int, start_factor: float) -> float:
+    progress = min(max(next_epoch / max(warmup_epochs, 1), 0.0), 1.0)
+    scale = start_factor + (1.0 - start_factor) * progress
+    return base_lr * scale
+
+
+def _should_use_channels_last(config: dict[str, Any], device: torch.device) -> bool:
+    runtime_cfg = config.get("runtime") or {}
+    return device.type == "cuda" and bool(runtime_cfg.get("channels_last", True))
+
+
+def _resolve_runtime_settings(config: dict[str, Any]) -> tuple[str, bool, bool]:
+    runtime_cfg = config.get("runtime") or {}
+    requested_device = str(runtime_cfg.get("device") or "cuda:0")
+    allow_cpu_fallback = bool(runtime_cfg.get("allow_cpu_fallback", False))
+    deterministic = bool(runtime_cfg.get("deterministic", False))
+    return requested_device, allow_cpu_fallback, deterministic
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    del worker_id
+    cv2.setNumThreads(0)
+    if hasattr(cv2, "ocl"):
+        cv2.ocl.setUseOpenCL(False)
 
 
 def _describe_loss(config: dict[str, Any]) -> str:
@@ -82,12 +192,14 @@ def _log_epoch_header(
 ) -> None:
     training_cfg = config["training"]
     grad_accum_steps = int(training_cfg.get("gradient_accumulation_steps", 1) or 1)
+    effective_batch_size = int(training_cfg["batch_size"]) * grad_accum_steps
     logger.info("%s", "=" * 108, extra=_phase_extra("SYSTEM"))
     logger.info("Epoch %d/%d started", epoch, total_epochs, extra=_phase_extra("SYSTEM"))
     logger.info(
-        "Hyperparams | lr=%s | train_batch_size=%s | val_batch_size=%s | test_batch_size=%s | optimizer=%s | scheduler=%s | weight_decay=%s | loss=%s | device=%s | amp=%s | grad_accum=%s | grad_clip=%s | log_interval=%s",
+        "Hyperparams | lr=%s | train_batch_size=%s | effective_train_batch_size=%s | val_batch_size=%s | test_batch_size=%s | optimizer=%s | scheduler=%s | weight_decay=%s | loss=%s | device=%s | amp=%s | grad_accum=%s | grad_clip=%s | log_interval=%s",
         _format_lr(optimizer.param_groups[0]["lr"]),
         training_cfg["batch_size"],
+        effective_batch_size,
         training_cfg["val_batch_size"],
         training_cfg.get("test_batch_size"),
         str(training_cfg["optimizer"]).lower(),
@@ -133,15 +245,24 @@ def _log_epoch_timing(
     epoch_total_time: float,
 ) -> None:
     logger.info(
-        "Epoch %d/%d finished | train_time=%s | eval_time=%s | eval_epoch_time=%s | epoch_total_time=%s | train_data_time=%s | eval_data_time=%s | train_avg_batch_time=%s | eval_avg_batch_time=%s | train_fastest_batch=%s | train_slowest_batch=%s | eval_fastest_batch=%s | eval_slowest_batch=%s",
+        "Epoch %d/%d finished | train_time=%s | eval_time=%s | epoch_total_time=%s | train_data_time=%s | eval_data_time=%s | train_transfer_time=%s | eval_transfer_time=%s | train_compute_time=%s | eval_compute_time=%s | train_samples_per_sec=%s | eval_samples_per_sec=%s | train_gpu_peak_alloc=%s | eval_gpu_peak_alloc=%s | train_gpu_peak_reserved=%s | eval_gpu_peak_reserved=%s | train_avg_batch_time=%s | eval_avg_batch_time=%s | train_fastest_batch=%s | train_slowest_batch=%s | eval_fastest_batch=%s | eval_slowest_batch=%s",
         epoch,
         total_epochs,
         _format_seconds(train_stats.get("total_time")),
         _format_seconds(eval_stats.get("total_time")),
-        _format_seconds(eval_stats.get("total_time")),
         _format_seconds(epoch_total_time),
         _format_seconds(train_stats.get("data_time")),
         _format_seconds(eval_stats.get("data_time")),
+        _format_seconds(train_stats.get("transfer_time")),
+        _format_seconds(eval_stats.get("transfer_time")),
+        _format_seconds(train_stats.get("compute_time")),
+        _format_seconds(eval_stats.get("compute_time")),
+        _format_scalar(train_stats.get("samples_per_second"), precision=2),
+        _format_scalar(eval_stats.get("samples_per_second"), precision=2),
+        _format_memory(train_stats.get("max_allocated_mb")),
+        _format_memory(eval_stats.get("max_allocated_mb")),
+        _format_memory(train_stats.get("max_reserved_mb")),
+        _format_memory(eval_stats.get("max_reserved_mb")),
         _format_seconds(train_stats.get("avg_batch_time")),
         _format_seconds(eval_stats.get("avg_batch_time")),
         _format_seconds(train_stats.get("min_batch_time")),
@@ -166,11 +287,26 @@ def _log_epoch_metrics(
     epoch: int,
     total_epochs: int,
     train_metrics: dict[str, Any],
-    val_metrics: dict[str, Any],
-    lr: float,
+    val_metrics: dict[str, Any] | None,
+    lr_start: float,
+    lr_end: float,
+    eval_ran: bool,
 ) -> None:
+    if not eval_ran or val_metrics is None:
+        logger.info(
+            "Epoch %d/%d metrics | train_loss=%s | train_mae=%s | train_mad=%s | lr_start=%s | lr_end=%s | validation=skipped",
+            epoch,
+            total_epochs,
+            _format_scalar(_safe_metric_value(train_metrics.get("loss"))),
+            _format_scalar(_safe_metric_value(train_metrics.get("mae"))),
+            _format_scalar(_safe_metric_value(train_metrics.get("mad"))),
+            _format_lr(lr_start),
+            _format_lr(lr_end),
+            extra=_phase_extra("SYSTEM"),
+        )
+        return
     logger.info(
-        "Epoch %d/%d metrics | train_loss=%s | val_loss=%s | train_mae=%s | val_mae=%s | train_mad=%s | val_mad=%s | lr=%s",
+        "Epoch %d/%d metrics | train_loss=%s | val_loss=%s | train_mae=%s | val_mae=%s | train_mad=%s | val_mad=%s | lr_start=%s | lr_end=%s",
         epoch,
         total_epochs,
         _format_scalar(_safe_metric_value(train_metrics.get("loss"))),
@@ -179,7 +315,8 @@ def _log_epoch_metrics(
         _format_scalar(_safe_metric_value(val_metrics.get("mae"))),
         _format_scalar(_safe_metric_value(train_metrics.get("mad"))),
         _format_scalar(_safe_metric_value(val_metrics.get("mad"))),
-        _format_lr(lr),
+        _format_lr(lr_start),
+        _format_lr(lr_end),
         extra=_phase_extra("SYSTEM"),
     )
 
@@ -191,6 +328,91 @@ def _log_dataloader_kwargs(logger, loader_kwargs: dict[str, Any]) -> None:
         loader_kwargs.get("pin_memory"),
         loader_kwargs.get("persistent_workers"),
         loader_kwargs.get("prefetch_factor"),
+    )
+
+
+def _build_effective_params_payload(
+    config: dict[str, Any],
+    runtime,
+    datasets: dict[str, Any],
+    loader_kwargs: dict[str, Any],
+    use_amp: bool,
+    use_channels_last: bool,
+) -> dict[str, Any]:
+    training_cfg = config["training"]
+    runtime_cfg = config.get("runtime") or {}
+    grad_accum_steps = _resolve_gradient_accumulation_steps(config)
+    total_epochs = int(training_cfg["epochs"])
+    warmup_epochs, warmup_start_factor = _resolve_warmup_settings(config, total_epochs)
+    early_stop_patience, early_stop_min_delta = _resolve_early_stopping(config)
+    return {
+        "dataset_sizes": {split: len(dataset) for split, dataset in datasets.items()},
+        "device": runtime.selected_device,
+        "requested_device": runtime.requested_device,
+        "deterministic": runtime.deterministic,
+        "channels_last": use_channels_last,
+        "epochs": total_epochs,
+        "batch_size": int(training_cfg["batch_size"]),
+        "val_batch_size": int(training_cfg["val_batch_size"]),
+        "test_batch_size": int(training_cfg["test_batch_size"]),
+        "gradient_accumulation_steps": grad_accum_steps,
+        "effective_train_batch_size": int(training_cfg["batch_size"]) * grad_accum_steps,
+        "optimizer": str(training_cfg["optimizer"]).lower(),
+        "lr": float(training_cfg["lr"]),
+        "weight_decay": float(training_cfg["weight_decay"]),
+        "scheduler": str(training_cfg.get("scheduler") or "none").lower(),
+        "warmup_epochs": warmup_epochs,
+        "warmup_start_factor": warmup_start_factor,
+        "min_lr": float(training_cfg["min_lr"]),
+        "loss": _describe_loss(config),
+        "amp": use_amp,
+        "compile": bool(training_cfg["compile"]),
+        "compile_mode": str(training_cfg.get("compile_mode") or "default"),
+        "eval_interval": _resolve_positive_int(training_cfg.get("eval_interval"), default=1),
+        "save_interval": _resolve_positive_int(training_cfg.get("save_interval"), default=1),
+        "early_stopping_patience": early_stop_patience,
+        "early_stopping_min_delta": early_stop_min_delta,
+        "num_workers": loader_kwargs.get("num_workers"),
+        "pin_memory": loader_kwargs.get("pin_memory"),
+        "persistent_workers": loader_kwargs.get("persistent_workers"),
+        "prefetch_factor": loader_kwargs.get("prefetch_factor"),
+        "verify_images": bool(config["data"]["verify_images"]),
+        "input_size": int(config["data"]["input_size"]),
+        "local_patch_size": int(config["data"]["local_patch_size"]),
+        "global_crop_mode": str(config["data"].get("global_crop_mode")),
+        "metadata_mode": str(config["model"]["metadata"].get("mode")),
+        "allow_cpu_fallback": bool(runtime_cfg.get("allow_cpu_fallback", False)),
+    }
+
+
+def _log_effective_params(logger, payload: dict[str, Any]) -> None:
+    logger.info(
+        "Effective params | device=%s | epochs=%s | batch_size=%s | effective_batch_size=%s | optimizer=%s | lr=%s | weight_decay=%s | scheduler=%s | warmup_epochs=%s | amp=%s | compile=%s(%s) | channels_last=%s | eval_interval=%s | early_stopping_patience=%s | num_workers=%s | pin_memory=%s | persistent_workers=%s | prefetch_factor=%s | verify_images=%s | input_size=%s | local_patch_size=%s | metadata_mode=%s | dataset_sizes=%s",
+        payload["device"],
+        payload["epochs"],
+        payload["batch_size"],
+        payload["effective_train_batch_size"],
+        payload["optimizer"],
+        _format_lr(payload["lr"]),
+        payload["weight_decay"],
+        payload["scheduler"],
+        payload["warmup_epochs"],
+        payload["amp"],
+        payload["compile"],
+        payload["compile_mode"],
+        payload["channels_last"],
+        payload["eval_interval"],
+        payload["early_stopping_patience"],
+        payload["num_workers"],
+        payload["pin_memory"],
+        payload["persistent_workers"],
+        payload["prefetch_factor"],
+        payload["verify_images"],
+        payload["input_size"],
+        payload["local_patch_size"],
+        payload["metadata_mode"],
+        payload["dataset_sizes"],
+        extra=_phase_extra("SYSTEM"),
     )
 
 
@@ -244,6 +466,22 @@ def _coerce_optional_int(value: Any, default: int) -> int:
     if value is None:
         return default
     return int(value)
+
+
+def _empty_phase_stats(phase: str) -> dict[str, Any]:
+    return {
+        "phase": phase,
+        "total_time": None,
+        "data_time": None,
+        "transfer_time": None,
+        "compute_time": None,
+        "avg_batch_time": None,
+        "min_batch_time": None,
+        "max_batch_time": None,
+        "samples_per_second": None,
+        "max_allocated_mb": None,
+        "max_reserved_mb": None,
+    }
 
 
 def _build_data_payload(
@@ -332,7 +570,7 @@ def _build_dataloaders(datasets: dict[str, Any], config: dict[str, Any], device:
             "persistent_workers": workers > 0,
         }
         if workers > 0:
-            default_prefetch = 4 if device.type == "cuda" else 2
+            default_prefetch = 2
             loader_kwargs["prefetch_factor"] = _coerce_optional_int(
                 training_cfg.get("prefetch_factor"),
                 default=default_prefetch,
@@ -345,14 +583,16 @@ def _build_dataloaders(datasets: dict[str, Any], config: dict[str, Any], device:
 
     if training_cfg.get("pin_memory") is not None:
         loader_kwargs["pin_memory"] = bool(training_cfg["pin_memory"])
+    if device.type != "cuda":
+        loader_kwargs["pin_memory"] = False
 
     if loader_kwargs["num_workers"] > 0:
         if training_cfg.get("persistent_workers") is not None:
             loader_kwargs["persistent_workers"] = bool(training_cfg["persistent_workers"])
         if training_cfg.get("prefetch_factor") is not None:
             loader_kwargs["prefetch_factor"] = int(training_cfg["prefetch_factor"])
-        elif device.type == "cuda":
-            loader_kwargs["prefetch_factor"] = max(4, int(loader_kwargs.get("prefetch_factor", 2)))
+        else:
+            loader_kwargs["prefetch_factor"] = int(loader_kwargs.get("prefetch_factor", 2))
     else:
         loader_kwargs.pop("prefetch_factor", None)
         loader_kwargs["persistent_workers"] = False
@@ -363,6 +603,7 @@ def _build_dataloaders(datasets: dict[str, Any], config: dict[str, Any], device:
             datasets["train"],
             batch_size=int(training_cfg["batch_size"]),
             shuffle=True,
+            worker_init_fn=_worker_init_fn if loader_kwargs["num_workers"] > 0 else None,
             **loader_kwargs,
         )
     if "val" in datasets:
@@ -370,6 +611,7 @@ def _build_dataloaders(datasets: dict[str, Any], config: dict[str, Any], device:
             datasets["val"],
             batch_size=int(training_cfg["val_batch_size"]),
             shuffle=False,
+            worker_init_fn=_worker_init_fn if loader_kwargs["num_workers"] > 0 else None,
             **loader_kwargs,
         )
     if "test" in datasets:
@@ -377,6 +619,7 @@ def _build_dataloaders(datasets: dict[str, Any], config: dict[str, Any], device:
             datasets["test"],
             batch_size=int(training_cfg["test_batch_size"]),
             shuffle=False,
+            worker_init_fn=_worker_init_fn if loader_kwargs["num_workers"] > 0 else None,
             **loader_kwargs,
         )
     return dataloaders, loader_kwargs
@@ -384,18 +627,44 @@ def _build_dataloaders(datasets: dict[str, Any], config: dict[str, Any], device:
 
 def _build_optimizer(model: torch.nn.Module, config: dict[str, Any]):
     training_cfg = config["training"]
-    params = [param for param in model.parameters() if param.requires_grad]
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or name.endswith(".bias") or "bn" in name.lower() or "norm" in name.lower():
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    params = []
+    if decay_params:
+        params.append({"params": decay_params, "weight_decay": float(training_cfg["weight_decay"])})
+    if no_decay_params:
+        params.append({"params": no_decay_params, "weight_decay": 0.0})
     name = training_cfg["optimizer"].lower()
+    use_fused = bool(torch.cuda.is_available()) and all(
+        param.device.type == "cuda"
+        for group in params
+        for param in group["params"]
+    )
+
+    def _try_build(optimizer_cls, **kwargs):
+        if use_fused and name in {"adam", "adamw"}:
+            try:
+                return optimizer_cls(params, fused=True, **kwargs)
+            except (TypeError, RuntimeError):
+                pass
+        return optimizer_cls(params, **kwargs)
+
     if name == "adam":
-        return torch.optim.Adam(params, lr=training_cfg["lr"], weight_decay=training_cfg["weight_decay"])
+        return _try_build(torch.optim.Adam, lr=training_cfg["lr"])
     if name == "adamw":
-        return torch.optim.AdamW(params, lr=training_cfg["lr"], weight_decay=training_cfg["weight_decay"])
+        return _try_build(torch.optim.AdamW, lr=training_cfg["lr"])
     if name == "sgd":
         return torch.optim.SGD(
             params,
             lr=training_cfg["lr"],
             momentum=training_cfg["momentum"],
-            weight_decay=training_cfg["weight_decay"],
             nesterov=True,
         )
     raise ValueError(f"不支持的优化器: {training_cfg['optimizer']}")
@@ -404,6 +673,7 @@ def _build_optimizer(model: torch.nn.Module, config: dict[str, Any]):
 def _build_scheduler(optimizer, config: dict[str, Any]):
     training_cfg = config["training"]
     name = training_cfg["scheduler"].lower()
+    warmup_epochs, _ = _resolve_warmup_settings(config, int(training_cfg["epochs"]))
     if name == "plateau":
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
@@ -415,7 +685,7 @@ def _build_scheduler(optimizer, config: dict[str, Any]):
     if name == "cosine":
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=training_cfg["epochs"],
+            T_max=max(1, int(training_cfg["epochs"]) - warmup_epochs),
             eta_min=training_cfg["min_lr"],
         )
     if name == "none":
@@ -497,13 +767,6 @@ def _resolve_config(
     return config, checkpoint_state
 
 
-def _resolve_runtime_settings(config: dict[str, Any]) -> tuple[str, bool]:
-    runtime_cfg = config.get("runtime") or {}
-    requested_device = str(runtime_cfg.get("device") or "cuda:0")
-    allow_cpu_fallback = bool(runtime_cfg.get("allow_cpu_fallback", False))
-    return requested_device, allow_cpu_fallback
-
-
 def train_main(
     config_path: str | Path,
     overrides: list[str] | None = None,
@@ -519,26 +782,28 @@ def train_main(
     if control is not None:
         control.update_phase("system", "initializing")
         control.reset_stop_logged()
-    seed_everything(int(config["experiment"]["seed"]))
+    requested_device, allow_cpu_fallback, deterministic = _resolve_runtime_settings(config)
+    seed_everything(int(config["experiment"]["seed"]), deterministic=deterministic)
 
     try:
         logger.info("训练任务开始 | run_dir=%s", run_dir, extra=_phase_extra("SYSTEM"))
         raise_if_stop_requested(control, logger, phase="system", scope="initializing", checkpoint="before_runtime_setup")
 
-        requested_device, allow_cpu_fallback = _resolve_runtime_settings(config)
         device, runtime = detect_runtime(
             requested_device=requested_device,
             allow_cpu_fallback=allow_cpu_fallback,
+            deterministic=deterministic,
         )
         write_json(runtime.to_dict(), run_dir / "runtime.json")
         logger.info(
-            "运行环境 | torch=%s | cuda_build=%s | cuda_available=%s | requested_device=%s | selected_device=%s | gpus=%s | cudnn_benchmark=%s | tf32_matmul=%s | tf32_cudnn=%s | matmul_precision=%s",
+            "运行环境 | torch=%s | cuda_build=%s | cuda_available=%s | requested_device=%s | selected_device=%s | gpus=%s | deterministic=%s | cudnn_benchmark=%s | tf32_matmul=%s | tf32_cudnn=%s | matmul_precision=%s",
             runtime.torch_version,
             runtime.cuda_build,
             runtime.cuda_available,
             runtime.requested_device,
             runtime.selected_device,
             runtime.device_names,
+            runtime.deterministic,
             runtime.cudnn_benchmark,
             runtime.tf32_matmul,
             runtime.tf32_cudnn,
@@ -556,11 +821,17 @@ def train_main(
         _log_dataloader_kwargs(logger, loader_kwargs)
 
         raise_if_stop_requested(control, logger, phase="system", scope="building_model", checkpoint="before_model_init")
+        use_channels_last = _should_use_channels_last(config, device)
         model = build_model(config).to(device)
-        if device.type == "cuda":
+        if use_channels_last:
             model = model.to(memory_format=torch.channels_last)
         log_device_probe(model, device, logger)
-        model = maybe_compile_model(model, bool(config["training"]["compile"]), logger)
+        model = maybe_compile_model(
+            model,
+            bool(config["training"]["compile"]),
+            logger,
+            mode=str(config["training"].get("compile_mode") or "default"),
+        )
         criterion = build_loss(config["training"]["loss"], config["training"]["smooth_l1_beta"])
         optimizer = _build_optimizer(unwrap_model(model), config)
         scheduler = _build_scheduler(optimizer, config)
@@ -571,7 +842,13 @@ def train_main(
         show_progress = bool(config["training"].get("progress_bar", True))
         log_interval = _resolve_log_interval(config)
         total_epochs = int(config["training"]["epochs"])
+        base_lr = float(config["training"]["lr"])
         scheduler_name = str(config["training"].get("scheduler") or "none").lower()
+        grad_accum_steps = _resolve_gradient_accumulation_steps(config)
+        warmup_epochs, warmup_start_factor = _resolve_warmup_settings(config, total_epochs)
+        eval_interval = _resolve_eval_interval(config, scheduler_name, logger)
+        save_interval = _resolve_save_interval(config)
+        early_stop_patience, early_stop_min_delta = _resolve_early_stopping(config)
 
         start_epoch = 1
         best_metric = None
@@ -581,17 +858,35 @@ def train_main(
             start_epoch = _restore_training_state(model, optimizer, scheduler, scaler, resume_state)
             best_metric = resume_state.get("best_metric")
             logger.info("已从 checkpoint 续训: %s | next_epoch=%d", resume_checkpoint, start_epoch)
+        elif warmup_epochs > 0:
+            _set_optimizer_lr(optimizer, _warmup_lr(base_lr, 1, warmup_epochs, warmup_start_factor))
 
         save_config(config, run_dir / "config.yaml")
+        effective_payload = _build_effective_params_payload(
+            config=config,
+            runtime=runtime,
+            datasets=datasets,
+            loader_kwargs=loader_kwargs,
+            use_amp=use_amp,
+            use_channels_last=use_channels_last,
+        )
+        effective_payload["eval_interval"] = eval_interval
+        effective_payload["save_interval"] = save_interval
+        effective_payload["gradient_accumulation_steps"] = grad_accum_steps
+        effective_payload["effective_train_batch_size"] = int(config["training"]["batch_size"]) * grad_accum_steps
+        write_json(effective_payload, run_dir / "effective_params.json")
+        _log_effective_params(logger, effective_payload)
         history_rows = []
         best_metric_name = _validate_best_metric(config["training"]["best_metric"])
         best_checkpoint_path = run_dir / "best_model.pt"
         last_checkpoint_path = run_dir / "last_checkpoint.pt"
+        epochs_without_improvement = 0
 
         for epoch in range(start_epoch, total_epochs + 1):
             raise_if_stop_requested(control, logger, phase="system", scope=f"epoch-{epoch}", checkpoint="before_epoch")
             epoch_started = time.perf_counter()
             _log_epoch_header(logger, config, optimizer, device, use_amp, epoch, total_epochs, log_interval)
+            lr_start = float(optimizer.param_groups[0]["lr"])
 
             train_metrics, _, train_stats = run_epoch(
                 model=model,
@@ -613,44 +908,68 @@ def train_main(
                 logger=logger,
                 log_interval=log_interval,
                 control=control,
+                grad_accum_steps=grad_accum_steps,
+                channels_last=use_channels_last,
             )
             raise_if_stop_requested(control, logger, phase="train", scope=f"{epoch}/{total_epochs}", checkpoint="after_train_phase")
-            lr_before_scheduler = optimizer.param_groups[0]["lr"]
-            val_metrics, val_predictions, val_stats = run_epoch(
-                model=model,
-                loader=dataloaders["val"],
-                criterion=criterion,
-                device=device,
-                target_mode=config["model"]["target_mode"],
-                target_normalizer=normalizers["target"],
-                train=False,
-                relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
-                optimizer=None,
-                scaler=None,
-                gradient_clip=None,
-                epoch=epoch,
-                total_epochs=total_epochs,
-                amp=use_amp,
-                show_progress=show_progress,
-                collect_predictions=True,
-                logger=logger,
-                log_interval=log_interval,
-                lr_override=lr_before_scheduler,
-                control=control,
-            )
-            raise_if_stop_requested(control, logger, phase="eval", scope=f"{epoch}/{total_epochs}", checkpoint="after_eval_phase")
+            run_validation = "val" in dataloaders and _should_run_validation(epoch, total_epochs, eval_interval)
+            val_metrics = None
+            val_predictions = pd.DataFrame()
+            val_stats = _empty_phase_stats("eval")
+            if run_validation:
+                val_metrics, val_predictions, val_stats = run_epoch(
+                    model=model,
+                    loader=dataloaders["val"],
+                    criterion=criterion,
+                    device=device,
+                    target_mode=config["model"]["target_mode"],
+                    target_normalizer=normalizers["target"],
+                    train=False,
+                    relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
+                    optimizer=None,
+                    scaler=None,
+                    gradient_clip=None,
+                    epoch=epoch,
+                    total_epochs=total_epochs,
+                    amp=use_amp,
+                    show_progress=show_progress,
+                    collect_predictions=True,
+                    logger=logger,
+                    log_interval=log_interval,
+                    lr_override=lr_start,
+                    control=control,
+                    channels_last=use_channels_last,
+                )
+                raise_if_stop_requested(control, logger, phase="eval", scope=f"{epoch}/{total_epochs}", checkpoint="after_eval_phase")
+            else:
+                logger.info(
+                    "Epoch %d/%d 跳过验证 | eval_interval=%d | 当前仅执行训练与 checkpoint 保存。",
+                    epoch,
+                    total_epochs,
+                    eval_interval,
+                    extra=_phase_extra("SYSTEM"),
+                )
 
-            if scheduler is not None:
-                if config["training"]["scheduler"].lower() == "plateau":
+            previous_lr = float(optimizer.param_groups[0]["lr"])
+            scheduler_label = scheduler_name
+            if epoch < warmup_epochs:
+                scheduler_label = "warmup"
+                _set_optimizer_lr(
+                    optimizer,
+                    _warmup_lr(base_lr, epoch + 1, warmup_epochs, warmup_start_factor),
+                )
+            elif scheduler is not None:
+                if scheduler_name == "plateau" and val_metrics is not None:
                     scheduler.step(val_metrics[best_metric_name] if val_metrics[best_metric_name] is not None else val_metrics["loss"])
-                else:
+                elif scheduler_name != "plateau":
                     scheduler.step()
-            current_lr = optimizer.param_groups[0]["lr"]
-            _log_learning_rate_update(logger, scheduler_name, epoch, total_epochs, lr_before_scheduler, current_lr)
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            _log_learning_rate_update(logger, scheduler_label, epoch, total_epochs, previous_lr, current_lr)
 
-            current_metric = val_metrics[best_metric_name]
-            if current_metric is not None and (best_metric is None or current_metric < best_metric):
+            current_metric = val_metrics[best_metric_name] if val_metrics is not None else None
+            if run_validation and _metric_improved(current_metric, best_metric, early_stop_min_delta):
                 best_metric = current_metric
+                epochs_without_improvement = 0
                 _save_checkpoint(
                     best_checkpoint_path,
                     model=model,
@@ -672,28 +991,33 @@ def train_main(
                     best_checkpoint_path,
                     extra=_phase_extra("SYSTEM"),
                 )
+            elif run_validation and current_metric is not None:
+                epochs_without_improvement += 1
 
-            _save_checkpoint(
-                last_checkpoint_path,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                epoch=epoch,
-                best_metric=best_metric,
-                config=config,
-                normalizers=normalizers,
-            )
+            if _should_save_checkpoint(epoch, total_epochs, save_interval):
+                _save_checkpoint(
+                    last_checkpoint_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=epoch,
+                    best_metric=best_metric,
+                    config=config,
+                    normalizers=normalizers,
+                )
 
             history_row = {
                 "epoch": epoch,
                 "train_loss": train_metrics["loss"],
-                "val_loss": val_metrics["loss"],
+                "val_loss": val_metrics["loss"] if val_metrics is not None else None,
                 "train_mae": train_metrics["mae"],
-                "val_mae": val_metrics["mae"],
+                "val_mae": val_metrics["mae"] if val_metrics is not None else None,
                 "train_mad": train_metrics["mad"],
-                "val_mad": val_metrics["mad"],
-                "lr": current_lr,
+                "val_mad": val_metrics["mad"] if val_metrics is not None else None,
+                "lr_start": lr_start,
+                "lr_end": current_lr,
+                "eval_ran": run_validation,
             }
             history_rows.append(history_row)
             pd.DataFrame(history_rows).to_csv(run_dir / "history.csv", index=False)
@@ -712,10 +1036,50 @@ def train_main(
                 total_epochs=total_epochs,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,
-                lr=history_row["lr"],
+                lr_start=lr_start,
+                lr_end=current_lr,
+                eval_ran=run_validation,
             )
+            if run_validation and early_stop_patience > 0 and epochs_without_improvement >= early_stop_patience:
+                _save_checkpoint(
+                    last_checkpoint_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=epoch,
+                    best_metric=best_metric,
+                    config=config,
+                    normalizers=normalizers,
+                )
+                logger.info(
+                    "Early stopping triggered | epoch=%d/%d | patience=%d | min_delta=%s | best_%s=%s",
+                    epoch,
+                    total_epochs,
+                    early_stop_patience,
+                    _format_scalar(early_stop_min_delta),
+                    best_metric_name,
+                    _format_scalar(best_metric),
+                    extra=_phase_extra("SYSTEM"),
+                )
+                break
 
         history_df = pd.DataFrame(history_rows)
+
+        if not best_checkpoint_path.exists():
+            fallback_epoch = int(history_rows[-1]["epoch"]) if history_rows else 0
+            logger.warning("训练过程中未产生 best checkpoint，已回退为最后一个 checkpoint。")
+            _save_checkpoint(
+                best_checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=fallback_epoch,
+                best_metric=best_metric,
+                config=config,
+                normalizers=normalizers,
+            )
 
         raise_if_stop_requested(control, logger, phase="system", scope="best-val", checkpoint="before_best_val")
         best_state = _load_checkpoint_state(best_checkpoint_path)
@@ -740,6 +1104,7 @@ def train_main(
             lr_override=optimizer.param_groups[0]["lr"],
             progress_label="best-val",
             control=control,
+            channels_last=use_channels_last,
         )
         val_predictions.to_csv(run_dir / "val_predictions.csv", index=False)
         write_json(val_metrics, run_dir / "val_metrics.json")
@@ -774,6 +1139,7 @@ def train_main(
                 lr_override=optimizer.param_groups[0]["lr"],
                 progress_label="test",
                 control=control,
+                channels_last=use_channels_last,
             )
             test_predictions.to_csv(run_dir / "test_predictions.csv", index=False)
             write_json(test_metrics, run_dir / "test_metrics.json")
@@ -831,22 +1197,24 @@ def evaluate_main(
     )
     run_dir = _prepare_run_dir(config, purpose=split)
     logger = setup_logger(run_dir)
-    seed_everything(int(config["experiment"]["seed"]))
+    requested_device, allow_cpu_fallback, deterministic = _resolve_runtime_settings(config)
+    seed_everything(int(config["experiment"]["seed"]), deterministic=deterministic)
 
-    requested_device, allow_cpu_fallback = _resolve_runtime_settings(config)
     device, runtime = detect_runtime(
         requested_device=requested_device,
         allow_cpu_fallback=allow_cpu_fallback,
+        deterministic=deterministic,
     )
     write_json(runtime.to_dict(), run_dir / "runtime.json")
     logger.info(
-        "运行环境 | torch=%s | cuda_build=%s | cuda_available=%s | requested_device=%s | selected_device=%s | gpus=%s | cudnn_benchmark=%s | tf32_matmul=%s | tf32_cudnn=%s | matmul_precision=%s",
+        "运行环境 | torch=%s | cuda_build=%s | cuda_available=%s | requested_device=%s | selected_device=%s | gpus=%s | deterministic=%s | cudnn_benchmark=%s | tf32_matmul=%s | tf32_cudnn=%s | matmul_precision=%s",
         runtime.torch_version,
         runtime.cuda_build,
         runtime.cuda_available,
         runtime.requested_device,
         runtime.selected_device,
         runtime.device_names,
+        runtime.deterministic,
         runtime.cudnn_benchmark,
         runtime.tf32_matmul,
         runtime.tf32_cudnn,
@@ -863,7 +1231,8 @@ def evaluate_main(
         raise ValueError(f"请求评估的 split 不存在: {split}")
 
     model = build_model(config).to(device)
-    if device.type == "cuda":
+    use_channels_last = _should_use_channels_last(config, device)
+    if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
     log_device_probe(model, device, logger)
     unwrap_model(model).load_state_dict(checkpoint_state["model"])
@@ -889,10 +1258,20 @@ def evaluate_main(
         logger=logger,
         log_interval=log_interval,
         progress_label=split,
+        channels_last=use_channels_last,
     )
     predictions.to_csv(run_dir / f"{split}_predictions.csv", index=False)
     write_json(metrics, run_dir / f"{split}_metrics.json")
     save_config(config, run_dir / "config.yaml")
+    effective_payload = _build_effective_params_payload(
+        config=config,
+        runtime=runtime,
+        datasets=datasets,
+        loader_kwargs=loader_kwargs,
+        use_amp=use_amp,
+        use_channels_last=use_channels_last,
+    )
+    write_json(effective_payload, run_dir / "effective_params.json")
     logger.info("%s 评估完成 | metrics=%s", split, metrics)
     return {"run_dir": str(run_dir), "metrics": metrics}
 
@@ -927,21 +1306,23 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
         # 这里直接调用内部训练逻辑，避免重复解析命令行。
         run_dir = _prepare_run_dir(trial_config, purpose="trial")
         logger_trial = setup_logger(run_dir, name=f"trial_{trial.number}")
-        seed_everything(int(trial_config["experiment"]["seed"]))
-        requested_device, allow_cpu_fallback = _resolve_runtime_settings(trial_config)
+        requested_device, allow_cpu_fallback, deterministic = _resolve_runtime_settings(trial_config)
+        seed_everything(int(trial_config["experiment"]["seed"]), deterministic=deterministic)
         device, runtime = detect_runtime(
             requested_device=requested_device,
             allow_cpu_fallback=allow_cpu_fallback,
+            deterministic=deterministic,
         )
         write_json(runtime.to_dict(), run_dir / "runtime.json")
         logger_trial.info(
-            "运行环境 | torch=%s | cuda_build=%s | cuda_available=%s | requested_device=%s | selected_device=%s | gpus=%s | cudnn_benchmark=%s | tf32_matmul=%s | tf32_cudnn=%s | matmul_precision=%s",
+            "运行环境 | torch=%s | cuda_build=%s | cuda_available=%s | requested_device=%s | selected_device=%s | gpus=%s | deterministic=%s | cudnn_benchmark=%s | tf32_matmul=%s | tf32_cudnn=%s | matmul_precision=%s",
             runtime.torch_version,
             runtime.cuda_build,
             runtime.cuda_available,
             runtime.requested_device,
             runtime.selected_device,
             runtime.device_names,
+            runtime.deterministic,
             runtime.cudnn_benchmark,
             runtime.tf32_matmul,
             runtime.tf32_cudnn,
@@ -953,10 +1334,16 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
         dataloaders, loader_kwargs = _build_dataloaders(datasets, trial_config, device)
         _log_dataloader_kwargs(logger_trial, loader_kwargs)
         model = build_model(trial_config).to(device)
-        if device.type == "cuda":
+        use_channels_last = _should_use_channels_last(trial_config, device)
+        if use_channels_last:
             model = model.to(memory_format=torch.channels_last)
         log_device_probe(model, device, logger_trial)
-        model = maybe_compile_model(model, bool(trial_config["training"]["compile"]), logger_trial)
+        model = maybe_compile_model(
+            model,
+            bool(trial_config["training"]["compile"]),
+            logger_trial,
+            mode=str(trial_config["training"].get("compile_mode") or "default"),
+        )
         criterion = build_loss(trial_config["training"]["loss"], trial_config["training"]["smooth_l1_beta"])
         optimizer = _build_optimizer(unwrap_model(model), trial_config)
         scheduler = _build_scheduler(optimizer, trial_config)
@@ -967,12 +1354,18 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
         show_progress = bool(trial_config["training"].get("progress_bar", True))
         log_interval = _resolve_log_interval(trial_config)
         total_epochs = int(trial_config["training"]["epochs"])
+        base_lr = float(trial_config["training"]["lr"])
         scheduler_name = str(trial_config["training"].get("scheduler") or "none").lower()
+        grad_accum_steps = _resolve_gradient_accumulation_steps(trial_config)
+        warmup_epochs, warmup_start_factor = _resolve_warmup_settings(trial_config, total_epochs)
+        if warmup_epochs > 0:
+            _set_optimizer_lr(optimizer, _warmup_lr(base_lr, 1, warmup_epochs, warmup_start_factor))
 
         best_metric = None
         for epoch in range(1, total_epochs + 1):
             epoch_started = time.perf_counter()
             _log_epoch_header(logger_trial, trial_config, optimizer, device, use_amp, epoch, total_epochs, log_interval)
+            lr_start = float(optimizer.param_groups[0]["lr"])
             train_metrics, _, train_stats = run_epoch(
                 model=model,
                 loader=dataloaders["train"],
@@ -992,8 +1385,9 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
                 collect_predictions=False,
                 logger=logger_trial,
                 log_interval=log_interval,
+                grad_accum_steps=grad_accum_steps,
+                channels_last=use_channels_last,
             )
-            lr_before_scheduler = optimizer.param_groups[0]["lr"]
             val_metrics, _, val_stats = run_epoch(
                 model=model,
                 loader=dataloaders["val"],
@@ -1010,17 +1404,26 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
                 collect_predictions=False,
                 logger=logger_trial,
                 log_interval=log_interval,
-                lr_override=lr_before_scheduler,
+                lr_override=lr_start,
+                channels_last=use_channels_last,
             )
             value = val_metrics["mae"] if val_metrics["mae"] is not None else 1e9
             trial.report(value, step=epoch)
-            if scheduler is not None:
+            previous_lr = float(optimizer.param_groups[0]["lr"])
+            scheduler_label = scheduler_name
+            if epoch < warmup_epochs:
+                scheduler_label = "warmup"
+                _set_optimizer_lr(
+                    optimizer,
+                    _warmup_lr(base_lr, epoch + 1, warmup_epochs, warmup_start_factor),
+                )
+            elif scheduler is not None:
                 if trial_config["training"]["scheduler"].lower() == "plateau":
                     scheduler.step(value)
                 else:
                     scheduler.step()
-            current_lr = optimizer.param_groups[0]["lr"]
-            _log_learning_rate_update(logger_trial, scheduler_name, epoch, total_epochs, lr_before_scheduler, current_lr)
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            _log_learning_rate_update(logger_trial, scheduler_label, epoch, total_epochs, previous_lr, current_lr)
             _log_epoch_timing(
                 logger=logger_trial,
                 epoch=epoch,
@@ -1035,7 +1438,9 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
                 total_epochs=total_epochs,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,
-                lr=current_lr,
+                lr_start=lr_start,
+                lr_end=current_lr,
+                eval_ran=True,
             )
             best_metric = value if best_metric is None else min(best_metric, value)
             if trial.should_prune():

@@ -18,10 +18,14 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
-def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+def move_batch_to_device(
+    batch: dict[str, Any],
+    device: torch.device,
+    channels_last: bool = True,
+) -> dict[str, Any]:
     def _move(value: Any):
         if torch.is_tensor(value):
-            if value.ndim == 4 and device.type == "cuda":
+            if value.ndim == 4 and device.type == "cuda" and channels_last:
                 return value.to(device=device, non_blocking=True, memory_format=torch.channels_last)
             return value.to(device=device, non_blocking=True)
         if isinstance(value, dict):
@@ -150,6 +154,12 @@ def _format_lr_value(value: float | None) -> str:
     return f"{value:.6g}"
 
 
+def _format_memory_value(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.1f}MB"
+
+
 def _resolve_scope_label(epoch: int | None, total_epochs: int | None, progress_label: str | None) -> str:
     if progress_label:
         return progress_label
@@ -164,6 +174,23 @@ def _should_log_batch(batch_number: int, total_batches: int, log_interval: int) 
     if batch_number == 1 or batch_number == total_batches:
         return True
     return log_interval > 0 and (batch_number % log_interval == 0)
+
+
+def _cuda_memory_stats(device: torch.device) -> dict[str, float | None]:
+    if device.type != "cuda":
+        return {
+            "allocated_mb": None,
+            "reserved_mb": None,
+            "max_allocated_mb": None,
+            "max_reserved_mb": None,
+        }
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    return {
+        "allocated_mb": torch.cuda.memory_allocated(device_index) / (1024**2),
+        "reserved_mb": torch.cuda.memory_reserved(device_index) / (1024**2),
+        "max_allocated_mb": torch.cuda.max_memory_allocated(device_index) / (1024**2),
+        "max_reserved_mb": torch.cuda.max_memory_reserved(device_index) / (1024**2),
+    }
 
 
 def run_epoch(
@@ -188,10 +215,13 @@ def run_epoch(
     lr_override: float | None = None,
     progress_label: str | None = None,
     control: TrainingControl | None = None,
+    grad_accum_steps: int = 1,
+    channels_last: bool = True,
 ) -> tuple[dict[str, Any], pd.DataFrame, dict[str, Any]]:
     model.train(train)
     phase = "train" if train else "eval"
     amp_enabled = bool(amp) and device.type == "cuda"
+    grad_accum_steps = max(1, int(grad_accum_steps))
     total_loss = 0.0
     total_count = 0
     y_true: list[float] = []
@@ -220,18 +250,24 @@ def run_epoch(
     next_batch_wait_started = phase_started
     total_data_wait = 0.0
     total_batch_time = 0.0
+    total_transfer_time = 0.0
+    total_compute_time = 0.0
     min_batch_time = None
     max_batch_time = None
+    optimizer_steps = 0
+    sample_count = 0
 
     if logger is not None:
         logger.info(
-            "Phase started | scope=%s | batches=%d | batch_size=%s | lr=%s | device=%s | amp=%s",
+            "Phase started | scope=%s | batches=%d | batch_size=%s | lr=%s | device=%s | amp=%s | grad_accum=%d | channels_last=%s",
             scope_label,
             total_batches,
             getattr(loader, "batch_size", "n/a"),
             _format_lr_value(lr_override if lr_override is not None else (optimizer.param_groups[0]["lr"] if optimizer is not None else None)),
             device,
             amp_enabled,
+            grad_accum_steps,
+            channels_last and device.type == "cuda",
             extra={"phase": phase.upper()},
         )
         logger.info(
@@ -239,6 +275,11 @@ def run_epoch(
             scope_label,
             extra={"phase": phase.upper()},
         )
+
+    if train and optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     try:
         with _inference_context(train):
@@ -267,13 +308,14 @@ def run_epoch(
                         seconds=data_wait_seconds,
                     )
                 batch_started = time.perf_counter()
-                batch = move_batch_to_device(batch, device)
+                transfer_started = time.perf_counter()
+                batch = move_batch_to_device(batch, device, channels_last=channels_last)
+                transfer_time_seconds = time.perf_counter() - transfer_started
+                total_transfer_time += transfer_time_seconds
                 if batch_index == 0:
                     _log_first_batch_device(batch, model, device, logger, phase=phase, epoch=epoch)
                 has_target_mask = batch["has_target"].view(-1).bool()
-
-                if train:
-                    optimizer.zero_grad(set_to_none=True)
+                compute_started = time.perf_counter()
 
                 with _autocast_context(device, amp_enabled):
                     outputs = model(batch)
@@ -288,19 +330,31 @@ def run_epoch(
                         )
                         loss = criterion(prediction[has_target_mask], normalized_target[has_target_mask])
 
+                batch_number = batch_index + 1
+                should_step = train and (
+                    batch_number % grad_accum_steps == 0 or batch_number == total_batches
+                )
+
                 if train and loss is not None:
+                    scaled_loss = loss / grad_accum_steps
                     if scaler is not None:
-                        scaler.scale(loss).backward()
-                        if gradient_clip and gradient_clip > 0:
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-                        scaler.step(optimizer)
-                        scaler.update()
+                        scaler.scale(scaled_loss).backward()
+                        if should_step:
+                            if gradient_clip and gradient_clip > 0:
+                                scaler.unscale_(optimizer)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad(set_to_none=True)
+                            optimizer_steps += 1
                     else:
-                        loss.backward()
-                        if gradient_clip and gradient_clip > 0:
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-                        optimizer.step()
+                        scaled_loss.backward()
+                        if should_step:
+                            if gradient_clip and gradient_clip > 0:
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            optimizer_steps += 1
 
                 pred_boneage = decode_boneage_prediction(
                     prediction,
@@ -311,6 +365,7 @@ def run_epoch(
                 )
 
                 batch_size = prediction.shape[0]
+                sample_count += batch_size
                 if loss is not None:
                     valid_count = int(has_target_mask.sum().item())
                     total_loss += float(loss.detach().item()) * valid_count
@@ -359,12 +414,13 @@ def run_epoch(
                 if show_progress and ((batch_index + 1) % 10 == 0 or (batch_index + 1) == len(loader)):
                     _set_progress_postfix(progress, total_loss=total_loss, total_count=total_count)
 
+                compute_time = time.perf_counter() - compute_started
+                total_compute_time += compute_time
                 batch_time = time.perf_counter() - batch_started
                 total_batch_time += batch_time
                 min_batch_time = batch_time if min_batch_time is None else min(min_batch_time, batch_time)
                 max_batch_time = batch_time if max_batch_time is None else max(max_batch_time, batch_time)
 
-                batch_number = batch_index + 1
                 if logger is not None and _should_log_batch(batch_number, total_batches, log_interval):
                     phase_elapsed = time.perf_counter() - phase_started
                     eta_seconds = 0.0
@@ -372,8 +428,10 @@ def run_epoch(
                         eta_seconds = (phase_elapsed / batch_number) * (total_batches - batch_number)
                     current_loss = float(loss.detach().item()) if loss is not None else math.nan
                     current_lr = lr_override if lr_override is not None else (optimizer.param_groups[0]["lr"] if optimizer is not None else None)
+                    memory_stats = _cuda_memory_stats(device)
+                    samples_per_second = batch_size / max(batch_time, 1e-8)
                     logger.info(
-                        "Scope %s | Batch %d/%d | loss=%s | lr=%s | batch_time=%s | data_time=%s | elapsed=%s | eta=%s",
+                        "Scope %s | Batch %d/%d | loss=%s | lr=%s | batch_time=%s | data_time=%s | transfer_time=%s | compute_time=%s | samples_per_sec=%.2f | gpu_alloc=%s | gpu_peak_reserved=%s | elapsed=%s | eta=%s",
                         scope_label,
                         batch_number,
                         total_batches,
@@ -381,6 +439,11 @@ def run_epoch(
                         _format_lr_value(current_lr),
                         _format_seconds(batch_time),
                         _format_seconds(data_wait_seconds),
+                        _format_seconds(transfer_time_seconds),
+                        _format_seconds(compute_time),
+                        samples_per_second,
+                        _format_memory_value(memory_stats["allocated_mb"]),
+                        _format_memory_value(memory_stats["max_reserved_mb"]),
                         _format_seconds(phase_elapsed),
                         _format_seconds(eta_seconds),
                         extra={"phase": phase.upper()},
@@ -398,19 +461,28 @@ def run_epoch(
         if progress is not None:
             progress.close()
 
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     phase_total_time = time.perf_counter() - phase_started
     metrics = compute_regression_metrics(y_true, y_pred)
     metrics["loss"] = total_loss / max(total_count, 1) if total_count > 0 else None
     batch_count = max(total_batches, 0)
+    memory_stats = _cuda_memory_stats(device)
     phase_stats = {
         "phase": phase,
         "scope_label": scope_label,
         "total_time": phase_total_time,
         "data_time": total_data_wait,
+        "transfer_time": total_transfer_time,
+        "compute_time": total_compute_time,
         "avg_batch_time": (total_batch_time / batch_count) if batch_count > 0 else None,
         "min_batch_time": min_batch_time,
         "max_batch_time": max_batch_time,
         "batch_count": batch_count,
+        "sample_count": sample_count,
+        "samples_per_second": (sample_count / phase_total_time) if phase_total_time > 0 else None,
+        "optimizer_steps": optimizer_steps,
+        **memory_stats,
     }
 
     if not collect_predictions:
@@ -418,16 +490,22 @@ def run_epoch(
         metrics["relative_age_error_slope"] = None
         if logger is not None:
             logger.info(
-                "Phase finished | scope=%s | loss=%s | mae=%s | mad=%s | phase_time=%s | data_time=%s | avg_batch_time=%s | min_batch_time=%s | max_batch_time=%s",
+                "Phase finished | scope=%s | loss=%s | mae=%s | mad=%s | phase_time=%s | data_time=%s | transfer_time=%s | compute_time=%s | samples_per_sec=%.2f | avg_batch_time=%s | min_batch_time=%s | max_batch_time=%s | gpu_peak_alloc=%s | gpu_peak_reserved=%s | optimizer_steps=%d",
                 scope_label,
                 _format_loss_value(metrics.get("loss")),
                 _format_loss_value(metrics.get("mae")),
                 _format_loss_value(metrics.get("mad")),
                 _format_seconds(phase_total_time),
                 _format_seconds(total_data_wait),
+                _format_seconds(total_transfer_time),
+                _format_seconds(total_compute_time),
+                phase_stats["samples_per_second"] or 0.0,
                 _format_seconds(phase_stats["avg_batch_time"]),
                 _format_seconds(min_batch_time),
                 _format_seconds(max_batch_time),
+                _format_memory_value(memory_stats["max_allocated_mb"]),
+                _format_memory_value(memory_stats["max_reserved_mb"]),
+                optimizer_steps,
                 extra={"phase": phase.upper()},
             )
         return metrics, pd.DataFrame(), phase_stats
@@ -454,16 +532,22 @@ def run_epoch(
         metrics["relative_age_error_slope"] = None
     if logger is not None:
         logger.info(
-            "Phase finished | scope=%s | loss=%s | mae=%s | mad=%s | phase_time=%s | data_time=%s | avg_batch_time=%s | min_batch_time=%s | max_batch_time=%s",
+            "Phase finished | scope=%s | loss=%s | mae=%s | mad=%s | phase_time=%s | data_time=%s | transfer_time=%s | compute_time=%s | samples_per_sec=%.2f | avg_batch_time=%s | min_batch_time=%s | max_batch_time=%s | gpu_peak_alloc=%s | gpu_peak_reserved=%s | optimizer_steps=%d",
             scope_label,
             _format_loss_value(metrics.get("loss")),
             _format_loss_value(metrics.get("mae")),
             _format_loss_value(metrics.get("mad")),
             _format_seconds(phase_total_time),
             _format_seconds(total_data_wait),
+            _format_seconds(total_transfer_time),
+            _format_seconds(total_compute_time),
+            phase_stats["samples_per_second"] or 0.0,
             _format_seconds(phase_stats["avg_batch_time"]),
             _format_seconds(min_batch_time),
             _format_seconds(max_batch_time),
+            _format_memory_value(memory_stats["max_allocated_mb"]),
+            _format_memory_value(memory_stats["max_reserved_mb"]),
+            optimizer_steps,
             extra={"phase": phase.upper()},
         )
     return metrics, prediction_df, phase_stats

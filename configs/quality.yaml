@@ -1,0 +1,47 @@
+data:
+  global_crop_margin_ratio: 0.1
+
+model:
+  ensemble_mode: ensemble
+  metadata:
+    mode: mlp
+    dropout: 0.2
+  local_branch:
+    dropout: 0.22
+  head:
+    dropout: 0.28
+
+augmentation:
+  affine_p: 0.72
+  rotation_limit: 12
+  translate_limit: 0.05
+  scale_limit: 0.12
+  shear_limit: 4
+  use_noise: true
+  noise_std_min: 0.005
+  noise_std_max: 0.02
+  noise_p: 0.18
+  use_blur: true
+  blur_limit: 3
+  blur_p: 0.08
+
+training:
+  epochs: 50
+  batch_size: 8
+  val_batch_size: 8
+  test_batch_size: 8
+  lr: 0.0002
+  weight_decay: 0.0007
+  scheduler: cosine
+  warmup_epochs: 4
+  warmup_start_factor: 0.15
+  smooth_l1_beta: 0.4
+  gradient_accumulation_steps: 2
+  eval_interval: 1
+  save_interval: 1
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.015
+  workers_override: 2
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true

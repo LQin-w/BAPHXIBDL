@@ -1,0 +1,43 @@
+data:
+  input_size: 320
+  local_patch_size: 80
+  global_crop_margin_ratio: 0.06
+
+model:
+  ensemble_mode: resnet
+  metadata:
+    mode: mlp
+    dropout: 0.12
+  local_branch:
+    dropout: 0.15
+  head:
+    dropout: 0.2
+
+augmentation:
+  affine_p: 0.55
+  rotation_limit: 8
+  translate_limit: 0.03
+  scale_limit: 0.08
+  shear_limit: 2
+
+training:
+  epochs: 30
+  batch_size: 12
+  val_batch_size: 12
+  test_batch_size: 12
+  lr: 0.0003
+  weight_decay: 0.0003
+  scheduler: cosine
+  warmup_epochs: 2
+  warmup_start_factor: 0.25
+  gradient_accumulation_steps: 1
+  compile: true
+  compile_mode: reduce-overhead
+  eval_interval: 2
+  save_interval: 2
+  early_stopping_patience: 6
+  early_stopping_min_delta: 0.03
+  workers_override: 2
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true

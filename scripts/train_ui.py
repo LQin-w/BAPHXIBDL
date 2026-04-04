@@ -39,6 +39,7 @@ PRESET_OPTIONS: dict[str, list[str]] = {
     "training.optimizer": ["adamw", "adam", "sgd"],
     "training.scheduler": ["plateau", "cosine", "none"],
     "training.loss": ["smoothl1", "l1", "mse"],
+    "training.compile_mode": ["reduce-overhead", "default", "max-autotune"],
     "training.best_metric": ["mae", "mad", "loss"],
     "optuna.direction": ["minimize", "maximize"],
 }
@@ -56,6 +57,7 @@ STRICT_OPTIONS: dict[str, set[str]] = {
     "training.optimizer": {"adamw", "adam", "sgd"},
     "training.scheduler": {"plateau", "cosine", "none"},
     "training.loss": {"smoothl1", "l1", "mse"},
+    "training.compile_mode": {"reduce-overhead", "default", "max-autotune"},
     "training.best_metric": {"mae", "mad", "loss"},
     "optuna.direction": {"minimize", "maximize"},
 }

@@ -6,6 +6,9 @@ from typing import Any
 
 import yaml
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "default.yaml"
+
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as handle:
@@ -58,10 +61,16 @@ def load_config(
     checkpoint_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config: dict[str, Any] = {}
+    if DEFAULT_CONFIG_PATH.exists():
+        config = deep_merge(config, load_yaml(DEFAULT_CONFIG_PATH))
     if checkpoint_config:
         config = deep_merge(config, checkpoint_config)
     if config_path:
-        config = deep_merge(config, load_yaml(config_path))
+        config_file = Path(config_path)
+        default_resolved = DEFAULT_CONFIG_PATH.resolve()
+        config_resolved = config_file.resolve()
+        if config_resolved != default_resolved:
+            config = deep_merge(config, load_yaml(config_file))
     config = deep_merge(config, parse_overrides(overrides))
     return config
 

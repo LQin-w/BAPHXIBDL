@@ -6,10 +6,13 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
 
 from ..training.normalization import ScalarNormalizer
+
+cv2.setNumThreads(0)
+if hasattr(cv2, "ocl"):
+    cv2.ocl.setUseOpenCL(False)
 
 
 @dataclass
@@ -22,13 +25,22 @@ def generate_heatmap(height: int, width: int, keypoints: list[list[float]], sigm
     heatmap = np.zeros((height, width), dtype=np.float32)
     if sigma <= 0:
         sigma = 8.0
-    yy, xx = np.mgrid[0:height, 0:width]
+    radius = max(1, int(np.ceil(sigma * 3.0)))
     for x_coord, y_coord, visibility in keypoints:
         if visibility <= 0:
             continue
         if x_coord <= 0 and y_coord <= 0:
             continue
-        heatmap += np.exp(-((xx - x_coord) ** 2 + (yy - y_coord) ** 2) / (2.0 * sigma**2))
+        x_min = max(0, int(np.floor(x_coord)) - radius)
+        x_max = min(width, int(np.floor(x_coord)) + radius + 1)
+        y_min = max(0, int(np.floor(y_coord)) - radius)
+        y_max = min(height, int(np.floor(y_coord)) + radius + 1)
+        if x_max <= x_min or y_max <= y_min:
+            continue
+        yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
+        heatmap[y_min:y_max, x_min:x_max] += np.exp(
+            -((xx - x_coord) ** 2 + (yy - y_coord) ** 2) / (2.0 * sigma**2)
+        ).astype(np.float32)
     if heatmap.max() > 0:
         heatmap /= heatmap.max()
     return heatmap.astype(np.float32)
@@ -111,32 +123,54 @@ def _crop_to_bbox_context(
     return cropped_image, cropped_heatmap, cropped_keypoints, cropped_bbox
 
 
-def _resize_with_geometry(
+def _crop_image_to_bbox_context(
     image: np.ndarray,
-    heatmap: np.ndarray,
     keypoints: np.ndarray,
     bbox: list[float],
-    target_size: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
-    source_height, source_width = image.shape
-    if source_height == target_size and source_width == target_size:
-        return image, heatmap, keypoints, bbox
+    margin_ratio: float,
+) -> tuple[np.ndarray, np.ndarray, list[float]]:
+    height, width = image.shape
+    bbox = _sanitize_coco_bbox((height, width), bbox)
+    x_coord, y_coord, box_width, box_height = bbox
+    margin_x = box_width * margin_ratio
+    margin_y = box_height * margin_ratio
 
-    resized_image = cv2.resize(image, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
-    resized_heatmap = cv2.resize(heatmap, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
-    scale_x = target_size / max(source_width, 1)
-    scale_y = target_size / max(source_height, 1)
+    x0 = max(0, int(np.floor(x_coord - margin_x)))
+    y0 = max(0, int(np.floor(y_coord - margin_y)))
+    x1 = min(width, int(np.ceil(x_coord + box_width + margin_x)))
+    y1 = min(height, int(np.ceil(y_coord + box_height + margin_y)))
 
-    resized_keypoints = keypoints.copy()
-    resized_keypoints[:, 0] *= scale_x
-    resized_keypoints[:, 1] *= scale_y
-    resized_bbox = [
-        float(bbox[0] * scale_x),
-        float(bbox[1] * scale_y),
-        float(bbox[2] * scale_x),
-        float(bbox[3] * scale_y),
+    if x1 <= x0 or y1 <= y0:
+        return image, keypoints, bbox
+
+    cropped_image = image[y0:y1, x0:x1]
+    cropped_keypoints = keypoints.copy()
+    valid_mask = cropped_keypoints[:, 2] > 0
+    cropped_keypoints[valid_mask, 0] -= x0
+    cropped_keypoints[valid_mask, 1] -= y0
+    cropped_bbox = [
+        float(bbox[0] - x0),
+        float(bbox[1] - y0),
+        float(bbox[2]),
+        float(bbox[3]),
     ]
-    return resized_image, resized_heatmap, resized_keypoints, resized_bbox
+    return cropped_image, cropped_keypoints, cropped_bbox
+
+
+def _load_grayscale_image(path: str) -> np.ndarray:
+    image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError(f"无法读取灰度图像: {path}")
+    return image
+
+
+def _build_keypoints_array(keypoints: list[list[float]], max_keypoints: int) -> np.ndarray:
+    keypoints_arr = np.zeros((max_keypoints, 3), dtype=np.float32)
+    for index, point in enumerate(keypoints[:max_keypoints]):
+        keypoints_arr[index, 0] = float(point[0])
+        keypoints_arr[index, 1] = float(point[1])
+        keypoints_arr[index, 2] = float(point[2])
+    return keypoints_arr
 
 
 class RHPEBoneAgeDataset(Dataset):
@@ -244,30 +278,32 @@ class RHPEBoneAgeDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
-        image = np.array(Image.open(record["image_path"]).convert("L"), dtype=np.uint8)
+        image = _load_grayscale_image(record["image_path"])
         bbox = _sanitize_coco_bbox(image.shape, list(record["bbox"]))
-        keypoints = record["keypoints"][: self.max_keypoints]
-        sigma = max(bbox[2], bbox[3]) * float(self.config["data"]["heatmap_sigma_ratio"])
-        heatmap = generate_heatmap(image.shape[0], image.shape[1], keypoints, sigma=max(sigma, 6.0))
-        try:
-            image, heatmap, keypoints_arr, bbox = self._transform_roi(image, heatmap, bbox, keypoints)
-        except Exception as exc:
-            raise ValueError(f"样本 {record['id']} 在 ROI 几何变换阶段失败: {exc}") from exc
+        keypoints_arr = _build_keypoints_array(record["keypoints"], self.max_keypoints)
         if self.global_crop_mode == "bbox":
-            image, heatmap, keypoints_arr, bbox = _crop_to_bbox_context(
+            image, keypoints_arr, bbox = _crop_image_to_bbox_context(
                 image=image,
-                heatmap=heatmap,
                 keypoints=keypoints_arr,
                 bbox=bbox,
                 margin_ratio=self.global_crop_margin_ratio,
             )
-            image, heatmap, keypoints_arr, bbox = _resize_with_geometry(
-                image=image,
-                heatmap=heatmap,
-                keypoints=keypoints_arr,
-                bbox=bbox,
-                target_size=self.input_size,
+        sigma = max(bbox[2], bbox[3]) * float(self.config["data"]["heatmap_sigma_ratio"])
+        heatmap = generate_heatmap(
+            image.shape[0],
+            image.shape[1],
+            keypoints_arr.tolist(),
+            sigma=max(sigma, 6.0),
+        )
+        try:
+            image, heatmap, keypoints_arr, bbox = self._transform_roi(
+                image,
+                heatmap,
+                bbox,
+                keypoints_arr,
             )
+        except Exception as exc:
+            raise ValueError(f"样本 {record['id']} 在 ROI 几何变换阶段失败: {exc}") from exc
 
         image = self.image_intensity_transform(image=image)["image"].astype(np.float32)
         heatmap = np.clip(heatmap.astype(np.float32), 0.0, 1.0)

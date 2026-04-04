@@ -23,7 +23,9 @@ def _prepare_output_dir(output_dir: str | Path) -> Path:
 def _get_pyplot(output_dir: str | Path):
     plot_dir = _prepare_output_dir(output_dir)
     mplconfig_dir = Path(tempfile.mkdtemp(prefix="rhpe_boneage_mplconfig_"))
+    cache_dir = Path(tempfile.mkdtemp(prefix="rhpe_boneage_cache_"))
     os.environ["MPLCONFIGDIR"] = str(mplconfig_dir)
+    os.environ["XDG_CACHE_HOME"] = str(cache_dir)
     os.environ.setdefault("MPLBACKEND", "Agg")
     logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 
