@@ -19,6 +19,7 @@ from ..utils import detect_runtime, ensure_dir, seed_everything, setup_logger, s
 from ..utils.device import log_device_probe, maybe_compile_model
 from ..utils.io import timestamp
 from ..utils.plots import generate_training_report
+from .control import TrainingCancelledError, TrainingControl, raise_if_stop_requested
 from .engine import run_epoch, unwrap_model
 from .losses import build_loss
 from .normalization import ScalarNormalizer
@@ -503,7 +504,11 @@ def _resolve_runtime_settings(config: dict[str, Any]) -> tuple[str, bool]:
     return requested_device, allow_cpu_fallback
 
 
-def train_main(config_path: str | Path, overrides: list[str] | None = None) -> dict[str, Any]:
+def train_main(
+    config_path: str | Path,
+    overrides: list[str] | None = None,
+    control: TrainingControl | None = None,
+) -> dict[str, Any]:
     config, checkpoint_state = _resolve_config(
         config_path=config_path,
         overrides=overrides,
@@ -511,129 +516,165 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
     )
     run_dir = _prepare_run_dir(config, purpose="train")
     logger = setup_logger(run_dir)
+    if control is not None:
+        control.update_phase("system", "initializing")
+        control.reset_stop_logged()
     seed_everything(int(config["experiment"]["seed"]))
 
-    requested_device, allow_cpu_fallback = _resolve_runtime_settings(config)
-    device, runtime = detect_runtime(
-        requested_device=requested_device,
-        allow_cpu_fallback=allow_cpu_fallback,
-    )
-    write_json(runtime.to_dict(), run_dir / "runtime.json")
-    logger.info(
-        "运行环境 | torch=%s | cuda_build=%s | cuda_available=%s | requested_device=%s | selected_device=%s | gpus=%s | cudnn_benchmark=%s | tf32_matmul=%s | tf32_cudnn=%s | matmul_precision=%s",
-        runtime.torch_version,
-        runtime.cuda_build,
-        runtime.cuda_available,
-        runtime.requested_device,
-        runtime.selected_device,
-        runtime.device_names,
-        runtime.cudnn_benchmark,
-        runtime.tf32_matmul,
-        runtime.tf32_cudnn,
-        runtime.float32_matmul_precision,
-    )
-    if runtime.requested_device.startswith("cuda") and device.type != "cuda":
-        logger.warning("请求设备 %s 不可用，训练已回退到 CPU。", runtime.requested_device)
+    try:
+        logger.info("训练任务开始 | run_dir=%s", run_dir, extra=_phase_extra("SYSTEM"))
+        raise_if_stop_requested(control, logger, phase="system", scope="initializing", checkpoint="before_runtime_setup")
 
-    payload, reports = _build_data_payload(config, run_dir, checkpoint_state=checkpoint_state)
-    _log_reports(logger, reports)
-    datasets, normalizers = _build_datasets(payload, config, checkpoint_state=checkpoint_state)
-    dataloaders, loader_kwargs = _build_dataloaders(datasets, config, device)
-    write_json(loader_kwargs, run_dir / "dataloader.json")
-    _log_dataloader_kwargs(logger, loader_kwargs)
-
-    model = build_model(config).to(device)
-    if device.type == "cuda":
-        model = model.to(memory_format=torch.channels_last)
-    log_device_probe(model, device, logger)
-    model = maybe_compile_model(model, bool(config["training"]["compile"]), logger)
-    criterion = build_loss(config["training"]["loss"], config["training"]["smooth_l1_beta"])
-    optimizer = _build_optimizer(unwrap_model(model), config)
-    scheduler = _build_scheduler(optimizer, config)
-    scaler = None
-    use_amp = device.type == "cuda" and bool(config["training"]["amp"])
-    if use_amp:
-        scaler = torch.amp.GradScaler("cuda", enabled=True)
-    show_progress = bool(config["training"].get("progress_bar", True))
-    log_interval = _resolve_log_interval(config)
-    total_epochs = int(config["training"]["epochs"])
-    scheduler_name = str(config["training"].get("scheduler") or "none").lower()
-
-    start_epoch = 1
-    best_metric = None
-    resume_checkpoint = config["training"].get("resume_checkpoint")
-    if resume_checkpoint:
-        resume_state = _load_checkpoint_state(resume_checkpoint)
-        start_epoch = _restore_training_state(model, optimizer, scheduler, scaler, resume_state)
-        best_metric = resume_state.get("best_metric")
-        logger.info("已从 checkpoint 续训: %s | next_epoch=%d", resume_checkpoint, start_epoch)
-
-    save_config(config, run_dir / "config.yaml")
-    history_rows = []
-    best_metric_name = _validate_best_metric(config["training"]["best_metric"])
-    best_checkpoint_path = run_dir / "best_model.pt"
-    last_checkpoint_path = run_dir / "last_checkpoint.pt"
-
-    for epoch in range(start_epoch, total_epochs + 1):
-        epoch_started = time.perf_counter()
-        _log_epoch_header(logger, config, optimizer, device, use_amp, epoch, total_epochs, log_interval)
-
-        train_metrics, _, train_stats = run_epoch(
-            model=model,
-            loader=dataloaders["train"],
-            criterion=criterion,
-            device=device,
-            target_mode=config["model"]["target_mode"],
-            target_normalizer=normalizers["target"],
-            train=True,
-            relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
-            optimizer=optimizer,
-            scaler=scaler,
-            gradient_clip=float(config["training"]["gradient_clip"]),
-            epoch=epoch,
-            total_epochs=total_epochs,
-            amp=use_amp,
-            show_progress=show_progress,
-            collect_predictions=False,
-            logger=logger,
-            log_interval=log_interval,
+        requested_device, allow_cpu_fallback = _resolve_runtime_settings(config)
+        device, runtime = detect_runtime(
+            requested_device=requested_device,
+            allow_cpu_fallback=allow_cpu_fallback,
         )
-        lr_before_scheduler = optimizer.param_groups[0]["lr"]
-        val_metrics, val_predictions, val_stats = run_epoch(
-            model=model,
-            loader=dataloaders["val"],
-            criterion=criterion,
-            device=device,
-            target_mode=config["model"]["target_mode"],
-            target_normalizer=normalizers["target"],
-            train=False,
-            relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
-            optimizer=None,
-            scaler=None,
-            gradient_clip=None,
-            epoch=epoch,
-            total_epochs=total_epochs,
-            amp=use_amp,
-            show_progress=show_progress,
-            collect_predictions=True,
-            logger=logger,
-            log_interval=log_interval,
-            lr_override=lr_before_scheduler,
+        write_json(runtime.to_dict(), run_dir / "runtime.json")
+        logger.info(
+            "运行环境 | torch=%s | cuda_build=%s | cuda_available=%s | requested_device=%s | selected_device=%s | gpus=%s | cudnn_benchmark=%s | tf32_matmul=%s | tf32_cudnn=%s | matmul_precision=%s",
+            runtime.torch_version,
+            runtime.cuda_build,
+            runtime.cuda_available,
+            runtime.requested_device,
+            runtime.selected_device,
+            runtime.device_names,
+            runtime.cudnn_benchmark,
+            runtime.tf32_matmul,
+            runtime.tf32_cudnn,
+            runtime.float32_matmul_precision,
         )
+        if runtime.requested_device.startswith("cuda") and device.type != "cuda":
+            logger.warning("请求设备 %s 不可用，训练已回退到 CPU。", runtime.requested_device)
 
-        if scheduler is not None:
-            if config["training"]["scheduler"].lower() == "plateau":
-                scheduler.step(val_metrics[best_metric_name] if val_metrics[best_metric_name] is not None else val_metrics["loss"])
-            else:
-                scheduler.step()
-        current_lr = optimizer.param_groups[0]["lr"]
-        _log_learning_rate_update(logger, scheduler_name, epoch, total_epochs, lr_before_scheduler, current_lr)
+        raise_if_stop_requested(control, logger, phase="system", scope="loading_data", checkpoint="before_dataset_build")
+        payload, reports = _build_data_payload(config, run_dir, checkpoint_state=checkpoint_state)
+        _log_reports(logger, reports)
+        datasets, normalizers = _build_datasets(payload, config, checkpoint_state=checkpoint_state)
+        dataloaders, loader_kwargs = _build_dataloaders(datasets, config, device)
+        write_json(loader_kwargs, run_dir / "dataloader.json")
+        _log_dataloader_kwargs(logger, loader_kwargs)
 
-        current_metric = val_metrics[best_metric_name]
-        if current_metric is not None and (best_metric is None or current_metric < best_metric):
-            best_metric = current_metric
+        raise_if_stop_requested(control, logger, phase="system", scope="building_model", checkpoint="before_model_init")
+        model = build_model(config).to(device)
+        if device.type == "cuda":
+            model = model.to(memory_format=torch.channels_last)
+        log_device_probe(model, device, logger)
+        model = maybe_compile_model(model, bool(config["training"]["compile"]), logger)
+        criterion = build_loss(config["training"]["loss"], config["training"]["smooth_l1_beta"])
+        optimizer = _build_optimizer(unwrap_model(model), config)
+        scheduler = _build_scheduler(optimizer, config)
+        scaler = None
+        use_amp = device.type == "cuda" and bool(config["training"]["amp"])
+        if use_amp:
+            scaler = torch.amp.GradScaler("cuda", enabled=True)
+        show_progress = bool(config["training"].get("progress_bar", True))
+        log_interval = _resolve_log_interval(config)
+        total_epochs = int(config["training"]["epochs"])
+        scheduler_name = str(config["training"].get("scheduler") or "none").lower()
+
+        start_epoch = 1
+        best_metric = None
+        resume_checkpoint = config["training"].get("resume_checkpoint")
+        if resume_checkpoint:
+            resume_state = _load_checkpoint_state(resume_checkpoint)
+            start_epoch = _restore_training_state(model, optimizer, scheduler, scaler, resume_state)
+            best_metric = resume_state.get("best_metric")
+            logger.info("已从 checkpoint 续训: %s | next_epoch=%d", resume_checkpoint, start_epoch)
+
+        save_config(config, run_dir / "config.yaml")
+        history_rows = []
+        best_metric_name = _validate_best_metric(config["training"]["best_metric"])
+        best_checkpoint_path = run_dir / "best_model.pt"
+        last_checkpoint_path = run_dir / "last_checkpoint.pt"
+
+        for epoch in range(start_epoch, total_epochs + 1):
+            raise_if_stop_requested(control, logger, phase="system", scope=f"epoch-{epoch}", checkpoint="before_epoch")
+            epoch_started = time.perf_counter()
+            _log_epoch_header(logger, config, optimizer, device, use_amp, epoch, total_epochs, log_interval)
+
+            train_metrics, _, train_stats = run_epoch(
+                model=model,
+                loader=dataloaders["train"],
+                criterion=criterion,
+                device=device,
+                target_mode=config["model"]["target_mode"],
+                target_normalizer=normalizers["target"],
+                train=True,
+                relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
+                optimizer=optimizer,
+                scaler=scaler,
+                gradient_clip=float(config["training"]["gradient_clip"]),
+                epoch=epoch,
+                total_epochs=total_epochs,
+                amp=use_amp,
+                show_progress=show_progress,
+                collect_predictions=False,
+                logger=logger,
+                log_interval=log_interval,
+                control=control,
+            )
+            raise_if_stop_requested(control, logger, phase="train", scope=f"{epoch}/{total_epochs}", checkpoint="after_train_phase")
+            lr_before_scheduler = optimizer.param_groups[0]["lr"]
+            val_metrics, val_predictions, val_stats = run_epoch(
+                model=model,
+                loader=dataloaders["val"],
+                criterion=criterion,
+                device=device,
+                target_mode=config["model"]["target_mode"],
+                target_normalizer=normalizers["target"],
+                train=False,
+                relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
+                optimizer=None,
+                scaler=None,
+                gradient_clip=None,
+                epoch=epoch,
+                total_epochs=total_epochs,
+                amp=use_amp,
+                show_progress=show_progress,
+                collect_predictions=True,
+                logger=logger,
+                log_interval=log_interval,
+                lr_override=lr_before_scheduler,
+                control=control,
+            )
+            raise_if_stop_requested(control, logger, phase="eval", scope=f"{epoch}/{total_epochs}", checkpoint="after_eval_phase")
+
+            if scheduler is not None:
+                if config["training"]["scheduler"].lower() == "plateau":
+                    scheduler.step(val_metrics[best_metric_name] if val_metrics[best_metric_name] is not None else val_metrics["loss"])
+                else:
+                    scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+            _log_learning_rate_update(logger, scheduler_name, epoch, total_epochs, lr_before_scheduler, current_lr)
+
+            current_metric = val_metrics[best_metric_name]
+            if current_metric is not None and (best_metric is None or current_metric < best_metric):
+                best_metric = current_metric
+                _save_checkpoint(
+                    best_checkpoint_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=epoch,
+                    best_metric=best_metric,
+                    config=config,
+                    normalizers=normalizers,
+                )
+                val_predictions.to_csv(run_dir / "best_val_predictions.csv", index=False)
+                logger.info(
+                    "Best model updated | epoch=%d/%d | metric=%s | value=%s | path=%s",
+                    epoch,
+                    total_epochs,
+                    best_metric_name,
+                    _format_scalar(current_metric),
+                    best_checkpoint_path,
+                    extra=_phase_extra("SYSTEM"),
+                )
+
             _save_checkpoint(
-                best_checkpoint_path,
+                last_checkpoint_path,
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -643,99 +684,46 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
                 config=config,
                 normalizers=normalizers,
             )
-            val_predictions.to_csv(run_dir / "best_val_predictions.csv", index=False)
-            logger.info(
-                "Best model updated | epoch=%d/%d | metric=%s | value=%s | path=%s",
-                epoch,
-                total_epochs,
-                best_metric_name,
-                _format_scalar(current_metric),
-                best_checkpoint_path,
-                extra=_phase_extra("SYSTEM"),
+
+            history_row = {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "val_loss": val_metrics["loss"],
+                "train_mae": train_metrics["mae"],
+                "val_mae": val_metrics["mae"],
+                "train_mad": train_metrics["mad"],
+                "val_mad": val_metrics["mad"],
+                "lr": current_lr,
+            }
+            history_rows.append(history_row)
+            pd.DataFrame(history_rows).to_csv(run_dir / "history.csv", index=False)
+
+            _log_epoch_timing(
+                logger=logger,
+                epoch=epoch,
+                total_epochs=total_epochs,
+                train_stats=train_stats,
+                eval_stats=val_stats,
+                epoch_total_time=time.perf_counter() - epoch_started,
+            )
+            _log_epoch_metrics(
+                logger=logger,
+                epoch=epoch,
+                total_epochs=total_epochs,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                lr=history_row["lr"],
             )
 
-        _save_checkpoint(
-            last_checkpoint_path,
+        history_df = pd.DataFrame(history_rows)
+
+        raise_if_stop_requested(control, logger, phase="system", scope="best-val", checkpoint="before_best_val")
+        best_state = _load_checkpoint_state(best_checkpoint_path)
+        unwrap_model(model).load_state_dict(best_state["model"])
+        logger.info("开始加载最佳 checkpoint 并执行最终验证。", extra=_phase_extra("SYSTEM"))
+        val_metrics, val_predictions, _ = run_epoch(
             model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            epoch=epoch,
-            best_metric=best_metric,
-            config=config,
-            normalizers=normalizers,
-        )
-
-        history_row = {
-            "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "val_loss": val_metrics["loss"],
-            "train_mae": train_metrics["mae"],
-            "val_mae": val_metrics["mae"],
-            "train_mad": train_metrics["mad"],
-            "val_mad": val_metrics["mad"],
-            "lr": current_lr,
-        }
-        history_rows.append(history_row)
-        pd.DataFrame(history_rows).to_csv(run_dir / "history.csv", index=False)
-
-        _log_epoch_timing(
-            logger=logger,
-            epoch=epoch,
-            total_epochs=total_epochs,
-            train_stats=train_stats,
-            eval_stats=val_stats,
-            epoch_total_time=time.perf_counter() - epoch_started,
-        )
-        _log_epoch_metrics(
-            logger=logger,
-            epoch=epoch,
-            total_epochs=total_epochs,
-            train_metrics=train_metrics,
-            val_metrics=val_metrics,
-            lr=history_row["lr"],
-        )
-
-    history_df = pd.DataFrame(history_rows)
-
-    best_state = _load_checkpoint_state(best_checkpoint_path)
-    unwrap_model(model).load_state_dict(best_state["model"])
-    logger.info("开始加载最佳 checkpoint 并执行最终验证。", extra=_phase_extra("SYSTEM"))
-    val_metrics, val_predictions, _ = run_epoch(
-        model=model,
-        loader=dataloaders["val"],
-        criterion=criterion,
-        device=device,
-        target_mode=config["model"]["target_mode"],
-        target_normalizer=normalizers["target"],
-        train=False,
-        relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
-        epoch=None,
-        total_epochs=None,
-        amp=use_amp,
-        show_progress=show_progress,
-        collect_predictions=True,
-        logger=logger,
-        log_interval=log_interval,
-        lr_override=optimizer.param_groups[0]["lr"],
-        progress_label="best-val",
-    )
-    val_predictions.to_csv(run_dir / "val_predictions.csv", index=False)
-    write_json(val_metrics, run_dir / "val_metrics.json")
-
-    output = {
-        "run_dir": str(run_dir),
-        "best_checkpoint": str(best_checkpoint_path),
-        "last_checkpoint": str(last_checkpoint_path),
-        "val_metrics": val_metrics,
-    }
-    test_metrics = None
-    test_predictions = None
-    if "test" in dataloaders:
-        logger.info("开始执行 test 集评估。", extra=_phase_extra("SYSTEM"))
-        test_metrics, test_predictions, _ = run_epoch(
-            model=model,
-            loader=dataloaders["test"],
+            loader=dataloaders["val"],
             criterion=criterion,
             device=device,
             target_mode=config["model"]["target_mode"],
@@ -750,33 +738,83 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
             logger=logger,
             log_interval=log_interval,
             lr_override=optimizer.param_groups[0]["lr"],
-            progress_label="test",
+            progress_label="best-val",
+            control=control,
         )
-        test_predictions.to_csv(run_dir / "test_predictions.csv", index=False)
-        write_json(test_metrics, run_dir / "test_metrics.json")
-        output["test_metrics"] = test_metrics
+        val_predictions.to_csv(run_dir / "val_predictions.csv", index=False)
+        write_json(val_metrics, run_dir / "val_metrics.json")
 
-    try:
-        logger.info("开始生成训练报告文件。", extra=_phase_extra("SYSTEM"))
-        report_summary = generate_training_report(
-            output_dir=run_dir,
-            history_df=history_df,
-            val_predictions=val_predictions,
-            test_predictions=test_predictions,
-            val_metrics=val_metrics,
-            test_metrics=test_metrics,
-            config=config,
-            runtime=runtime.to_dict(),
-            best_metric_name=best_metric_name,
-            best_checkpoint_path=best_checkpoint_path,
-            last_checkpoint_path=last_checkpoint_path,
+        output = {
+            "run_dir": str(run_dir),
+            "best_checkpoint": str(best_checkpoint_path),
+            "last_checkpoint": str(last_checkpoint_path),
+            "val_metrics": val_metrics,
+        }
+        test_metrics = None
+        test_predictions = None
+        if "test" in dataloaders:
+            raise_if_stop_requested(control, logger, phase="system", scope="test", checkpoint="before_test_eval")
+            logger.info("开始执行 test 集评估。", extra=_phase_extra("SYSTEM"))
+            test_metrics, test_predictions, _ = run_epoch(
+                model=model,
+                loader=dataloaders["test"],
+                criterion=criterion,
+                device=device,
+                target_mode=config["model"]["target_mode"],
+                target_normalizer=normalizers["target"],
+                train=False,
+                relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
+                epoch=None,
+                total_epochs=None,
+                amp=use_amp,
+                show_progress=show_progress,
+                collect_predictions=True,
+                logger=logger,
+                log_interval=log_interval,
+                lr_override=optimizer.param_groups[0]["lr"],
+                progress_label="test",
+                control=control,
+            )
+            test_predictions.to_csv(run_dir / "test_predictions.csv", index=False)
+            write_json(test_metrics, run_dir / "test_metrics.json")
+            output["test_metrics"] = test_metrics
+
+        try:
+            raise_if_stop_requested(control, logger, phase="system", scope="report", checkpoint="before_report_generation")
+            logger.info("开始生成训练报告文件。", extra=_phase_extra("SYSTEM"))
+            report_summary = generate_training_report(
+                output_dir=run_dir,
+                history_df=history_df,
+                val_predictions=val_predictions,
+                test_predictions=test_predictions,
+                val_metrics=val_metrics,
+                test_metrics=test_metrics,
+                config=config,
+                runtime=runtime.to_dict(),
+                best_metric_name=best_metric_name,
+                best_checkpoint_path=best_checkpoint_path,
+                last_checkpoint_path=last_checkpoint_path,
+            )
+            output["best_summary"] = report_summary
+            logger.info("训练报告生成完成。", extra=_phase_extra("SYSTEM"))
+        except Exception as exc:
+            logger.exception("论文结果文件生成失败。")
+            raise RuntimeError(f"训练已完成，但论文结果文件生成失败: {exc}") from exc
+        return output
+    except TrainingCancelledError as exc:
+        logger.warning(
+            "训练已按请求停止 | phase=%s | scope=%s | checkpoint=%s",
+            exc.phase,
+            exc.scope or "n/a",
+            exc.checkpoint or "n/a",
+            extra=_phase_extra(exc.phase or "SYSTEM"),
         )
-        output["best_summary"] = report_summary
-        logger.info("训练报告生成完成。", extra=_phase_extra("SYSTEM"))
-    except Exception as exc:
-        logger.exception("论文结果文件生成失败。")
-        raise RuntimeError(f"训练已完成，但论文结果文件生成失败: {exc}") from exc
-    return output
+        if "device" in locals() and isinstance(device, torch.device) and device.type == "cuda":
+            torch.cuda.empty_cache()
+        raise
+    finally:
+        if control is not None:
+            control.update_phase("system", "idle")
 
 
 def evaluate_main(

@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
+from .control import TrainingControl, raise_if_stop_requested
 from .metrics import compute_regression_metrics
 
 
@@ -186,6 +187,7 @@ def run_epoch(
     log_interval: int = 20,
     lr_override: float | None = None,
     progress_label: str | None = None,
+    control: TrainingControl | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame, dict[str, Any]]:
     model.train(train)
     phase = "train" if train else "eval"
@@ -238,140 +240,163 @@ def run_epoch(
             extra={"phase": phase.upper()},
         )
 
-    with _inference_context(train):
-        for batch_index, batch in enumerate(progress):
-            data_wait_seconds = time.perf_counter() - next_batch_wait_started
-            total_data_wait += data_wait_seconds
-            if batch_index == 0:
-                _log_first_batch_wait(
+    try:
+        with _inference_context(train):
+            iterator = iter(progress)
+            batch_index = 0
+            while True:
+                raise_if_stop_requested(
+                    control,
                     logger,
                     phase=phase,
-                    epoch=epoch,
-                    seconds=data_wait_seconds,
+                    scope=scope_label,
+                    checkpoint="before_batch_fetch",
                 )
-            batch_started = time.perf_counter()
-            batch = move_batch_to_device(batch, device)
-            if batch_index == 0:
-                _log_first_batch_device(batch, model, device, logger, phase=phase, epoch=epoch)
-            has_target_mask = batch["has_target"].view(-1).bool()
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    break
 
-            if train:
-                optimizer.zero_grad(set_to_none=True)
-
-            with _autocast_context(device, amp_enabled):
-                outputs = model(batch)
-                prediction = outputs["prediction"]
-                loss = None
-                if has_target_mask.any():
-                    normalized_target = build_training_target(
-                        batch,
-                        target_mode,
-                        target_normalizer,
-                        relative_direction=relative_direction,
+                data_wait_seconds = time.perf_counter() - next_batch_wait_started
+                total_data_wait += data_wait_seconds
+                if batch_index == 0:
+                    _log_first_batch_wait(
+                        logger,
+                        phase=phase,
+                        epoch=epoch,
+                        seconds=data_wait_seconds,
                     )
-                    loss = criterion(prediction[has_target_mask], normalized_target[has_target_mask])
+                batch_started = time.perf_counter()
+                batch = move_batch_to_device(batch, device)
+                if batch_index == 0:
+                    _log_first_batch_device(batch, model, device, logger, phase=phase, epoch=epoch)
+                has_target_mask = batch["has_target"].view(-1).bool()
 
-            if train and loss is not None:
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    if gradient_clip and gradient_clip > 0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    if gradient_clip and gradient_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-                    optimizer.step()
+                if train:
+                    optimizer.zero_grad(set_to_none=True)
 
-            pred_boneage = decode_boneage_prediction(
-                prediction,
-                batch,
-                target_mode,
-                target_normalizer,
-                relative_direction=relative_direction,
-            )
+                with _autocast_context(device, amp_enabled):
+                    outputs = model(batch)
+                    prediction = outputs["prediction"]
+                    loss = None
+                    if has_target_mask.any():
+                        normalized_target = build_training_target(
+                            batch,
+                            target_mode,
+                            target_normalizer,
+                            relative_direction=relative_direction,
+                        )
+                        loss = criterion(prediction[has_target_mask], normalized_target[has_target_mask])
 
-            batch_size = prediction.shape[0]
-            if loss is not None:
-                valid_count = int(has_target_mask.sum().item())
-                total_loss += float(loss.detach().item()) * valid_count
-                total_count += valid_count
-
-            if has_target_mask.any():
-                y_true.extend(batch["boneage"][has_target_mask].detach().view(-1).cpu().tolist())
-                y_pred.extend(pred_boneage[has_target_mask].detach().view(-1).cpu().tolist())
-
-            if collect_predictions:
-                has_target_cpu = batch["has_target"].detach().view(-1).cpu().numpy().astype(bool)
-                boneage_cpu = batch["boneage"].detach().view(-1).cpu().numpy()
-                pred_boneage_cpu = pred_boneage.detach().view(-1).cpu().numpy()
-                chronological_cpu = batch["chronological"].detach().view(-1).cpu().numpy()
-                male_index_cpu = batch["male_index"].detach().view(-1).cpu().numpy()
-
-                for index in range(batch_size):
-                    gt_value = float(boneage_cpu[index]) if has_target_cpu[index] else np.nan
-                    pred_value = float(pred_boneage_cpu[index])
-                    abs_error = abs(pred_value - gt_value) if not np.isnan(gt_value) else np.nan
-                    if not np.isnan(gt_value):
-                        chronological_value = float(chronological_cpu[index])
-                        if relative_direction == "chronological_minus_boneage":
-                            relative_gt = chronological_value - gt_value
-                            relative_pred = chronological_value - pred_value
-                        else:
-                            relative_gt = gt_value - chronological_value
-                            relative_pred = pred_value - chronological_value
+                if train and loss is not None:
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                        if gradient_clip and gradient_clip > 0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
                     else:
-                        chronological_value = float(chronological_cpu[index])
-                        relative_gt = np.nan
-                        relative_pred = np.nan
-                    rows.append(
-                        {
-                            "ID": batch["id"][index],
-                            "gt_boneage": gt_value,
-                            "pred_boneage": pred_value,
-                            "abs_error": abs_error,
-                            "sex": int(male_index_cpu[index]),
-                            "chronological": chronological_value,
-                            "gt_relative_boneage": relative_gt,
-                            "pred_relative_boneage": relative_pred,
-                        }
-                    )
+                        loss.backward()
+                        if gradient_clip and gradient_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                        optimizer.step()
 
-            if show_progress and ((batch_index + 1) % 10 == 0 or (batch_index + 1) == len(loader)):
-                _set_progress_postfix(progress, total_loss=total_loss, total_count=total_count)
-
-            batch_time = time.perf_counter() - batch_started
-            total_batch_time += batch_time
-            min_batch_time = batch_time if min_batch_time is None else min(min_batch_time, batch_time)
-            max_batch_time = batch_time if max_batch_time is None else max(max_batch_time, batch_time)
-
-            batch_number = batch_index + 1
-            if logger is not None and _should_log_batch(batch_number, total_batches, log_interval):
-                phase_elapsed = time.perf_counter() - phase_started
-                eta_seconds = 0.0
-                if batch_number < total_batches and batch_number > 0:
-                    eta_seconds = (phase_elapsed / batch_number) * (total_batches - batch_number)
-                current_loss = float(loss.detach().item()) if loss is not None else math.nan
-                current_lr = lr_override if lr_override is not None else (optimizer.param_groups[0]["lr"] if optimizer is not None else None)
-                logger.info(
-                    "Scope %s | Batch %d/%d | loss=%s | lr=%s | batch_time=%s | data_time=%s | elapsed=%s | eta=%s",
-                    scope_label,
-                    batch_number,
-                    total_batches,
-                    _format_loss_value(current_loss),
-                    _format_lr_value(current_lr),
-                    _format_seconds(batch_time),
-                    _format_seconds(data_wait_seconds),
-                    _format_seconds(phase_elapsed),
-                    _format_seconds(eta_seconds),
-                    extra={"phase": phase.upper()},
+                pred_boneage = decode_boneage_prediction(
+                    prediction,
+                    batch,
+                    target_mode,
+                    target_normalizer,
+                    relative_direction=relative_direction,
                 )
-            next_batch_wait_started = time.perf_counter()
 
-    if progress is not None:
-        progress.close()
+                batch_size = prediction.shape[0]
+                if loss is not None:
+                    valid_count = int(has_target_mask.sum().item())
+                    total_loss += float(loss.detach().item()) * valid_count
+                    total_count += valid_count
+
+                if has_target_mask.any():
+                    y_true.extend(batch["boneage"][has_target_mask].detach().view(-1).cpu().tolist())
+                    y_pred.extend(pred_boneage[has_target_mask].detach().view(-1).cpu().tolist())
+
+                if collect_predictions:
+                    has_target_cpu = batch["has_target"].detach().view(-1).cpu().numpy().astype(bool)
+                    boneage_cpu = batch["boneage"].detach().view(-1).cpu().numpy()
+                    pred_boneage_cpu = pred_boneage.detach().view(-1).cpu().numpy()
+                    chronological_cpu = batch["chronological"].detach().view(-1).cpu().numpy()
+                    male_index_cpu = batch["male_index"].detach().view(-1).cpu().numpy()
+
+                    for index in range(batch_size):
+                        gt_value = float(boneage_cpu[index]) if has_target_cpu[index] else np.nan
+                        pred_value = float(pred_boneage_cpu[index])
+                        abs_error = abs(pred_value - gt_value) if not np.isnan(gt_value) else np.nan
+                        if not np.isnan(gt_value):
+                            chronological_value = float(chronological_cpu[index])
+                            if relative_direction == "chronological_minus_boneage":
+                                relative_gt = chronological_value - gt_value
+                                relative_pred = chronological_value - pred_value
+                            else:
+                                relative_gt = gt_value - chronological_value
+                                relative_pred = pred_value - chronological_value
+                        else:
+                            chronological_value = float(chronological_cpu[index])
+                            relative_gt = np.nan
+                            relative_pred = np.nan
+                        rows.append(
+                            {
+                                "ID": batch["id"][index],
+                                "gt_boneage": gt_value,
+                                "pred_boneage": pred_value,
+                                "abs_error": abs_error,
+                                "sex": int(male_index_cpu[index]),
+                                "chronological": chronological_value,
+                                "gt_relative_boneage": relative_gt,
+                                "pred_relative_boneage": relative_pred,
+                            }
+                        )
+
+                if show_progress and ((batch_index + 1) % 10 == 0 or (batch_index + 1) == len(loader)):
+                    _set_progress_postfix(progress, total_loss=total_loss, total_count=total_count)
+
+                batch_time = time.perf_counter() - batch_started
+                total_batch_time += batch_time
+                min_batch_time = batch_time if min_batch_time is None else min(min_batch_time, batch_time)
+                max_batch_time = batch_time if max_batch_time is None else max(max_batch_time, batch_time)
+
+                batch_number = batch_index + 1
+                if logger is not None and _should_log_batch(batch_number, total_batches, log_interval):
+                    phase_elapsed = time.perf_counter() - phase_started
+                    eta_seconds = 0.0
+                    if batch_number < total_batches and batch_number > 0:
+                        eta_seconds = (phase_elapsed / batch_number) * (total_batches - batch_number)
+                    current_loss = float(loss.detach().item()) if loss is not None else math.nan
+                    current_lr = lr_override if lr_override is not None else (optimizer.param_groups[0]["lr"] if optimizer is not None else None)
+                    logger.info(
+                        "Scope %s | Batch %d/%d | loss=%s | lr=%s | batch_time=%s | data_time=%s | elapsed=%s | eta=%s",
+                        scope_label,
+                        batch_number,
+                        total_batches,
+                        _format_loss_value(current_loss),
+                        _format_lr_value(current_lr),
+                        _format_seconds(batch_time),
+                        _format_seconds(data_wait_seconds),
+                        _format_seconds(phase_elapsed),
+                        _format_seconds(eta_seconds),
+                        extra={"phase": phase.upper()},
+                    )
+                next_batch_wait_started = time.perf_counter()
+                batch_index += 1
+                raise_if_stop_requested(
+                    control,
+                    logger,
+                    phase=phase,
+                    scope=scope_label,
+                    checkpoint="after_batch",
+                )
+    finally:
+        if progress is not None:
+            progress.close()
 
     phase_total_time = time.perf_counter() - phase_started
     metrics = compute_regression_metrics(y_true, y_pred)

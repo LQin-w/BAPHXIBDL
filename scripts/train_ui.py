@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import platform
 import queue
 import sys
@@ -486,6 +487,9 @@ class TrainUI:
         self.base_flat: OrderedDict[str, Any] = OrderedDict()
         self.loaded_config: dict[str, Any] = {}
         self.running = False
+        self.stop_requested = False
+        self.training_thread: threading.Thread | None = None
+        self.training_control = None
         self.log_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
         self._log_flush_scheduled = False
         self._max_log_chars = 200_000
@@ -582,6 +586,11 @@ class TrainUI:
             sys.stderr = self._original_stderr
 
     def _handle_close(self) -> None:
+        if self.running and self.training_control is not None:
+            if not self.stop_requested:
+                self.enqueue_output("[UI] 检测到窗口关闭请求，已先请求停止训练，请等待任务退出。\n")
+                self._request_stop_training()
+            return
         self._output_capture_enabled = False
         self._restore_output_redirects()
         self.root.destroy()
@@ -621,6 +630,22 @@ class TrainUI:
         self.output_text.configure(state=tk.NORMAL)
         self.output_text.delete("1.0", tk.END)
         self.output_text.configure(state=tk.DISABLED)
+
+    def _log_control_message(self, message: str, level: str = "info") -> None:
+        logger = logging.getLogger("rhpe_boneage")
+        if not logger.handlers:
+            return
+        log_method = getattr(logger, level, logger.info)
+        log_method(message, extra={"phase": "SYSTEM"})
+
+    def _configure_run_button(self, *, running: bool, stopping: bool = False) -> None:
+        if running and not stopping:
+            self.run_button.configure(text="停止训练", command=self._request_stop_training, state=tk.NORMAL)
+            return
+        if running and stopping:
+            self.run_button.configure(text="正在停止...", command=self._request_stop_training, state=tk.DISABLED)
+            return
+        self.run_button.configure(text="开始训练", command=self._start_training, state=tk.NORMAL)
 
     def _choose_config(self) -> None:
         selected = filedialog.askopenfilename(
@@ -835,24 +860,50 @@ class TrainUI:
     def _set_running(self, running: bool, message: str) -> None:
         self.running = running
         self.status_var.set(message)
-        self.run_button.configure(state=tk.DISABLED if running else tk.NORMAL)
         if running:
+            self._configure_run_button(running=True, stopping=self.stop_requested)
             self.progress.start(10)
         else:
             self.progress.stop()
+            self._configure_run_button(running=False)
+
+    def _reset_training_runtime(self) -> None:
+        self.running = False
+        self.stop_requested = False
+        self.training_thread = None
+        self.training_control = None
+
+    def _handle_training_stopped(self, stop_text: str) -> None:
+        self._reset_training_runtime()
+        self._set_running(False, "训练已停止。")
+        self.enqueue_output(f"\n[UI] 训练已停止: {stop_text}\n")
 
     def _handle_training_success(self, run_dir: str) -> None:
+        self._reset_training_runtime()
         self._set_running(False, f"训练完成。输出目录: {run_dir}")
         self.enqueue_output(f"\n[UI] 训练完成，输出目录: {run_dir}\n")
         messagebox.showinfo("训练完成", f"训练已完成。\n输出目录:\n{run_dir}")
 
     def _handle_training_error(self, error_text: str) -> None:
+        self._reset_training_runtime()
         self._set_running(False, "训练失败。")
         self.enqueue_output(f"\n[UI] 训练失败: {error_text}\n")
         messagebox.showerror("训练失败", error_text)
 
+    def _request_stop_training(self) -> None:
+        if not self.running or self.training_control is None or self.stop_requested:
+            return
+        self.stop_requested = True
+        self.training_control.request_stop()
+        phase, scope, _ = self.training_control.snapshot()
+        stop_message = f"用户请求停止训练 | phase={phase} | scope={scope or 'n/a'}"
+        self.status_var.set("正在请求停止训练...")
+        self._configure_run_button(running=True, stopping=True)
+        self.enqueue_output(f"[UI] {stop_message}\n")
+        self._log_control_message(stop_message, level="warning")
+
     def _start_training(self) -> None:
-        if self.running:
+        if self.running or (self.training_thread is not None and self.training_thread.is_alive()):
             return
         config_path = self.config_path_var.get().strip()
         if not Path(config_path).exists():
@@ -863,6 +914,10 @@ class TrainUI:
         except ValueError as exc:
             messagebox.showerror("配置错误", str(exc))
             return
+        from rhpe_boneage.training.control import TrainingCancelledError, TrainingControl
+
+        self.training_control = TrainingControl()
+        self.stop_requested = False
         self._set_running(True, "训练启动中...")
         self.enqueue_output(
             f"\n{'=' * 96}\n"
@@ -876,15 +931,21 @@ class TrainUI:
             try:
                 from rhpe_boneage.training.runner import train_main
 
-                result = train_main(config_path=config_path, overrides=overrides)
+                result = train_main(
+                    config_path=config_path,
+                    overrides=overrides,
+                    control=self.training_control,
+                )
                 run_dir = result.get("run_dir", "")
                 self.root.after(0, self._handle_training_success, run_dir)
+            except TrainingCancelledError as exc:
+                self.root.after(0, self._handle_training_stopped, str(exc))
             except Exception as exc:
                 traceback.print_exc(file=sys.stderr)
                 self.root.after(0, self._handle_training_error, str(exc))
 
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
+        self.training_thread = threading.Thread(target=_worker, daemon=True)
+        self.training_thread.start()
 
 
 def main() -> None:
