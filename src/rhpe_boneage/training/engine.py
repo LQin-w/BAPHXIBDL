@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from contextlib import nullcontext
 from typing import Any
@@ -59,6 +60,7 @@ def _log_first_batch_device(
         batch["local_images"].device,
         batch["global_heatmap"].device,
         batch["roi_vector"].device,
+        extra={"phase": phase.upper()},
     )
     logged_phases.add(phase)
     setattr(logger, "_logged_first_batch_phases", logged_phases)
@@ -125,7 +127,42 @@ def _log_first_batch_wait(logger, phase: str, epoch: int | None, seconds: float)
         phase,
         epoch,
         seconds,
+        extra={"phase": phase.upper()},
     )
+
+
+def _format_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return "n/a"
+    return f"{seconds:.2f}s"
+
+
+def _format_loss_value(value: float | None) -> str:
+    if value is None or math.isnan(value):
+        return "nan"
+    return f"{value:.4f}"
+
+
+def _format_lr_value(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.6g}"
+
+
+def _resolve_scope_label(epoch: int | None, total_epochs: int | None, progress_label: str | None) -> str:
+    if progress_label:
+        return progress_label
+    if total_epochs is not None and epoch is not None:
+        return f"{epoch}/{total_epochs}"
+    if epoch is not None:
+        return str(epoch)
+    return "n/a"
+
+
+def _should_log_batch(batch_number: int, total_batches: int, log_interval: int) -> bool:
+    if batch_number == 1 or batch_number == total_batches:
+        return True
+    return log_interval > 0 and (batch_number % log_interval == 0)
 
 
 def run_epoch(
@@ -146,7 +183,10 @@ def run_epoch(
     show_progress: bool = True,
     collect_predictions: bool = True,
     logger=None,
-) -> tuple[dict[str, Any], pd.DataFrame]:
+    log_interval: int = 20,
+    lr_override: float | None = None,
+    progress_label: str | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame, dict[str, Any]]:
     model.train(train)
     phase = "train" if train else "eval"
     amp_enabled = bool(amp) and device.type == "cuda"
@@ -156,37 +196,60 @@ def run_epoch(
     y_pred: list[float] = []
     rows: list[dict[str, Any]] | None = [] if collect_predictions else None
 
-    if total_epochs is not None and epoch is not None:
+    scope_label = _resolve_scope_label(epoch, total_epochs, progress_label)
+    if progress_label:
+        progress_desc = f"{phase} {progress_label}"
+    elif total_epochs is not None and epoch is not None:
         progress_desc = f"{phase} {epoch}/{total_epochs}"
     elif epoch is not None:
         progress_desc = f"{phase} epoch={epoch}"
     else:
         progress_desc = phase
+    total_batches = len(loader)
     progress = tqdm(
         loader,
         desc=progress_desc,
-        total=len(loader),
+        total=total_batches,
         dynamic_ncols=True,
         leave=False,
         disable=not show_progress,
     )
-    first_batch_wait_started = time.perf_counter()
-    if logger is not None and epoch == 1:
+    phase_started = time.perf_counter()
+    next_batch_wait_started = phase_started
+    total_data_wait = 0.0
+    total_batch_time = 0.0
+    min_batch_time = None
+    max_batch_time = None
+
+    if logger is not None:
         logger.info(
-            "正在等待首个 batch | phase=%s | epoch=%s | 首次可能因数据预处理、Windows DataLoader worker 启动和 torch.compile 预热而偏慢。",
-            phase,
-            epoch,
+            "Phase started | scope=%s | batches=%d | batch_size=%s | lr=%s | device=%s | amp=%s",
+            scope_label,
+            total_batches,
+            getattr(loader, "batch_size", "n/a"),
+            _format_lr_value(lr_override if lr_override is not None else (optimizer.param_groups[0]["lr"] if optimizer is not None else None)),
+            device,
+            amp_enabled,
+            extra={"phase": phase.upper()},
+        )
+        logger.info(
+            "正在等待首个 batch | scope=%s | 首次可能因数据预处理、DataLoader worker 启动和 torch.compile 预热而偏慢。",
+            scope_label,
+            extra={"phase": phase.upper()},
         )
 
     with _inference_context(train):
         for batch_index, batch in enumerate(progress):
+            data_wait_seconds = time.perf_counter() - next_batch_wait_started
+            total_data_wait += data_wait_seconds
             if batch_index == 0:
                 _log_first_batch_wait(
                     logger,
                     phase=phase,
                     epoch=epoch,
-                    seconds=time.perf_counter() - first_batch_wait_started,
+                    seconds=data_wait_seconds,
                 )
+            batch_started = time.perf_counter()
             batch = move_batch_to_device(batch, device)
             if batch_index == 0:
                 _log_first_batch_device(batch, model, device, logger, phase=phase, epoch=epoch)
@@ -279,16 +342,70 @@ def run_epoch(
             if show_progress and ((batch_index + 1) % 10 == 0 or (batch_index + 1) == len(loader)):
                 _set_progress_postfix(progress, total_loss=total_loss, total_count=total_count)
 
+            batch_time = time.perf_counter() - batch_started
+            total_batch_time += batch_time
+            min_batch_time = batch_time if min_batch_time is None else min(min_batch_time, batch_time)
+            max_batch_time = batch_time if max_batch_time is None else max(max_batch_time, batch_time)
+
+            batch_number = batch_index + 1
+            if logger is not None and _should_log_batch(batch_number, total_batches, log_interval):
+                phase_elapsed = time.perf_counter() - phase_started
+                eta_seconds = 0.0
+                if batch_number < total_batches and batch_number > 0:
+                    eta_seconds = (phase_elapsed / batch_number) * (total_batches - batch_number)
+                current_loss = float(loss.detach().item()) if loss is not None else math.nan
+                current_lr = lr_override if lr_override is not None else (optimizer.param_groups[0]["lr"] if optimizer is not None else None)
+                logger.info(
+                    "Scope %s | Batch %d/%d | loss=%s | lr=%s | batch_time=%s | data_time=%s | elapsed=%s | eta=%s",
+                    scope_label,
+                    batch_number,
+                    total_batches,
+                    _format_loss_value(current_loss),
+                    _format_lr_value(current_lr),
+                    _format_seconds(batch_time),
+                    _format_seconds(data_wait_seconds),
+                    _format_seconds(phase_elapsed),
+                    _format_seconds(eta_seconds),
+                    extra={"phase": phase.upper()},
+                )
+            next_batch_wait_started = time.perf_counter()
+
     if progress is not None:
         progress.close()
 
+    phase_total_time = time.perf_counter() - phase_started
     metrics = compute_regression_metrics(y_true, y_pred)
     metrics["loss"] = total_loss / max(total_count, 1) if total_count > 0 else None
+    batch_count = max(total_batches, 0)
+    phase_stats = {
+        "phase": phase,
+        "scope_label": scope_label,
+        "total_time": phase_total_time,
+        "data_time": total_data_wait,
+        "avg_batch_time": (total_batch_time / batch_count) if batch_count > 0 else None,
+        "min_batch_time": min_batch_time,
+        "max_batch_time": max_batch_time,
+        "batch_count": batch_count,
+    }
 
     if not collect_predictions:
         metrics["relative_age_error_corr"] = None
         metrics["relative_age_error_slope"] = None
-        return metrics, pd.DataFrame()
+        if logger is not None:
+            logger.info(
+                "Phase finished | scope=%s | loss=%s | mae=%s | mad=%s | phase_time=%s | data_time=%s | avg_batch_time=%s | min_batch_time=%s | max_batch_time=%s",
+                scope_label,
+                _format_loss_value(metrics.get("loss")),
+                _format_loss_value(metrics.get("mae")),
+                _format_loss_value(metrics.get("mad")),
+                _format_seconds(phase_total_time),
+                _format_seconds(total_data_wait),
+                _format_seconds(phase_stats["avg_batch_time"]),
+                _format_seconds(min_batch_time),
+                _format_seconds(max_batch_time),
+                extra={"phase": phase.upper()},
+            )
+        return metrics, pd.DataFrame(), phase_stats
 
     prediction_df = pd.DataFrame(rows)
     valid_df = prediction_df[prediction_df["gt_boneage"].notna()].copy()
@@ -310,4 +427,18 @@ def run_epoch(
     else:
         metrics["relative_age_error_corr"] = None
         metrics["relative_age_error_slope"] = None
-    return metrics, prediction_df
+    if logger is not None:
+        logger.info(
+            "Phase finished | scope=%s | loss=%s | mae=%s | mad=%s | phase_time=%s | data_time=%s | avg_batch_time=%s | min_batch_time=%s | max_batch_time=%s",
+            scope_label,
+            _format_loss_value(metrics.get("loss")),
+            _format_loss_value(metrics.get("mae")),
+            _format_loss_value(metrics.get("mad")),
+            _format_seconds(phase_total_time),
+            _format_seconds(total_data_wait),
+            _format_seconds(phase_stats["avg_batch_time"]),
+            _format_seconds(min_batch_time),
+            _format_seconds(max_batch_time),
+            extra={"phase": phase.upper()},
+        )
+    return metrics, prediction_df, phase_stats

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,129 @@ def _safe_metric_value(value: float | None) -> float:
     return value if value is not None else math.nan
 
 
+def _phase_extra(phase: str) -> dict[str, str]:
+    return {"phase": phase.upper()}
+
+
+def _format_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return "n/a"
+    return f"{seconds:.2f}s"
+
+
+def _format_scalar(value: Any, precision: int = 4) -> str:
+    if value is None:
+        return "nan"
+    try:
+        if math.isnan(float(value)):
+            return "nan"
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{float(value):.{precision}f}"
+
+
+def _format_lr(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.6g}"
+
+
+def _resolve_log_interval(config: dict[str, Any]) -> int:
+    raw_value = (config.get("training") or {}).get("log_interval", 20)
+    if raw_value is None:
+        return 20
+    return max(0, int(raw_value))
+
+
+def _describe_loss(config: dict[str, Any]) -> str:
+    loss_name = str(config["training"]["loss"]).lower()
+    if loss_name == "smoothl1":
+        return f"smoothl1(beta={config['training']['smooth_l1_beta']})"
+    return loss_name
+
+
+def _log_epoch_header(
+    logger,
+    config: dict[str, Any],
+    optimizer,
+    device: torch.device,
+    use_amp: bool,
+    epoch: int,
+    total_epochs: int,
+    log_interval: int,
+) -> None:
+    training_cfg = config["training"]
+    grad_accum_steps = int(training_cfg.get("gradient_accumulation_steps", 1) or 1)
+    logger.info("%s", "=" * 108, extra=_phase_extra("SYSTEM"))
+    logger.info("Epoch %d/%d started", epoch, total_epochs, extra=_phase_extra("SYSTEM"))
+    logger.info(
+        "Hyperparams | lr=%s | train_batch_size=%s | val_batch_size=%s | test_batch_size=%s | optimizer=%s | scheduler=%s | weight_decay=%s | loss=%s | device=%s | amp=%s | grad_accum=%s | grad_clip=%s | log_interval=%s",
+        _format_lr(optimizer.param_groups[0]["lr"]),
+        training_cfg["batch_size"],
+        training_cfg["val_batch_size"],
+        training_cfg.get("test_batch_size"),
+        str(training_cfg["optimizer"]).lower(),
+        str(training_cfg.get("scheduler") or "none").lower(),
+        training_cfg.get("weight_decay"),
+        _describe_loss(config),
+        device,
+        use_amp,
+        grad_accum_steps,
+        training_cfg.get("gradient_clip"),
+        log_interval,
+        extra=_phase_extra("SYSTEM"),
+    )
+
+
+def _log_learning_rate_update(
+    logger,
+    scheduler_name: str,
+    epoch: int,
+    total_epochs: int,
+    previous_lr: float,
+    current_lr: float,
+) -> None:
+    if math.isclose(previous_lr, current_lr, rel_tol=1e-12, abs_tol=1e-12):
+        return
+    logger.info(
+        "Learning rate updated | epoch=%d/%d | scheduler=%s | from=%s | to=%s",
+        epoch,
+        total_epochs,
+        scheduler_name,
+        _format_lr(previous_lr),
+        _format_lr(current_lr),
+        extra=_phase_extra("SYSTEM"),
+    )
+
+
+def _log_epoch_timing(
+    logger,
+    epoch: int,
+    total_epochs: int,
+    train_stats: dict[str, Any],
+    eval_stats: dict[str, Any],
+    epoch_total_time: float,
+) -> None:
+    logger.info(
+        "Epoch %d/%d finished | train_time=%s | eval_time=%s | eval_epoch_time=%s | epoch_total_time=%s | train_data_time=%s | eval_data_time=%s | train_avg_batch_time=%s | eval_avg_batch_time=%s | train_fastest_batch=%s | train_slowest_batch=%s | eval_fastest_batch=%s | eval_slowest_batch=%s",
+        epoch,
+        total_epochs,
+        _format_seconds(train_stats.get("total_time")),
+        _format_seconds(eval_stats.get("total_time")),
+        _format_seconds(eval_stats.get("total_time")),
+        _format_seconds(epoch_total_time),
+        _format_seconds(train_stats.get("data_time")),
+        _format_seconds(eval_stats.get("data_time")),
+        _format_seconds(train_stats.get("avg_batch_time")),
+        _format_seconds(eval_stats.get("avg_batch_time")),
+        _format_seconds(train_stats.get("min_batch_time")),
+        _format_seconds(train_stats.get("max_batch_time")),
+        _format_seconds(eval_stats.get("min_batch_time")),
+        _format_seconds(eval_stats.get("max_batch_time")),
+        extra=_phase_extra("SYSTEM"),
+    )
+
+
 def _validate_best_metric(metric_name: str) -> str:
     allowed = {"loss", "mae", "mad"}
     normalized = str(metric_name).strip().lower()
@@ -39,20 +163,23 @@ def _validate_best_metric(metric_name: str) -> str:
 def _log_epoch_metrics(
     logger,
     epoch: int,
+    total_epochs: int,
     train_metrics: dict[str, Any],
     val_metrics: dict[str, Any],
     lr: float,
 ) -> None:
     logger.info(
-        "Epoch %d | train_loss=%.4f | val_loss=%.4f | train_mae=%.4f | val_mae=%.4f | train_mad=%.4f | val_mad=%.4f | lr=%.6g",
+        "Epoch %d/%d metrics | train_loss=%s | val_loss=%s | train_mae=%s | val_mae=%s | train_mad=%s | val_mad=%s | lr=%s",
         epoch,
-        _safe_metric_value(train_metrics.get("loss")),
-        _safe_metric_value(val_metrics.get("loss")),
-        _safe_metric_value(train_metrics.get("mae")),
-        _safe_metric_value(val_metrics.get("mae")),
-        _safe_metric_value(train_metrics.get("mad")),
-        _safe_metric_value(val_metrics.get("mad")),
-        lr,
+        total_epochs,
+        _format_scalar(_safe_metric_value(train_metrics.get("loss"))),
+        _format_scalar(_safe_metric_value(val_metrics.get("loss"))),
+        _format_scalar(_safe_metric_value(train_metrics.get("mae"))),
+        _format_scalar(_safe_metric_value(val_metrics.get("mae"))),
+        _format_scalar(_safe_metric_value(train_metrics.get("mad"))),
+        _format_scalar(_safe_metric_value(val_metrics.get("mad"))),
+        _format_lr(lr),
+        extra=_phase_extra("SYSTEM"),
     )
 
 
@@ -428,7 +555,9 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
     if use_amp:
         scaler = torch.amp.GradScaler("cuda", enabled=True)
     show_progress = bool(config["training"].get("progress_bar", True))
+    log_interval = _resolve_log_interval(config)
     total_epochs = int(config["training"]["epochs"])
+    scheduler_name = str(config["training"].get("scheduler") or "none").lower()
 
     start_epoch = 1
     best_metric = None
@@ -446,7 +575,10 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
     last_checkpoint_path = run_dir / "last_checkpoint.pt"
 
     for epoch in range(start_epoch, total_epochs + 1):
-        train_metrics, _ = run_epoch(
+        epoch_started = time.perf_counter()
+        _log_epoch_header(logger, config, optimizer, device, use_amp, epoch, total_epochs, log_interval)
+
+        train_metrics, _, train_stats = run_epoch(
             model=model,
             loader=dataloaders["train"],
             criterion=criterion,
@@ -464,8 +596,10 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
             show_progress=show_progress,
             collect_predictions=False,
             logger=logger,
+            log_interval=log_interval,
         )
-        val_metrics, val_predictions = run_epoch(
+        lr_before_scheduler = optimizer.param_groups[0]["lr"]
+        val_metrics, val_predictions, val_stats = run_epoch(
             model=model,
             loader=dataloaders["val"],
             criterion=criterion,
@@ -483,6 +617,8 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
             show_progress=show_progress,
             collect_predictions=True,
             logger=logger,
+            log_interval=log_interval,
+            lr_override=lr_before_scheduler,
         )
 
         if scheduler is not None:
@@ -490,6 +626,8 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
                 scheduler.step(val_metrics[best_metric_name] if val_metrics[best_metric_name] is not None else val_metrics["loss"])
             else:
                 scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+        _log_learning_rate_update(logger, scheduler_name, epoch, total_epochs, lr_before_scheduler, current_lr)
 
         current_metric = val_metrics[best_metric_name]
         if current_metric is not None and (best_metric is None or current_metric < best_metric):
@@ -506,6 +644,15 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
                 normalizers=normalizers,
             )
             val_predictions.to_csv(run_dir / "best_val_predictions.csv", index=False)
+            logger.info(
+                "Best model updated | epoch=%d/%d | metric=%s | value=%s | path=%s",
+                epoch,
+                total_epochs,
+                best_metric_name,
+                _format_scalar(current_metric),
+                best_checkpoint_path,
+                extra=_phase_extra("SYSTEM"),
+            )
 
         _save_checkpoint(
             last_checkpoint_path,
@@ -527,14 +674,23 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
             "val_mae": val_metrics["mae"],
             "train_mad": train_metrics["mad"],
             "val_mad": val_metrics["mad"],
-            "lr": optimizer.param_groups[0]["lr"],
+            "lr": current_lr,
         }
         history_rows.append(history_row)
         pd.DataFrame(history_rows).to_csv(run_dir / "history.csv", index=False)
 
+        _log_epoch_timing(
+            logger=logger,
+            epoch=epoch,
+            total_epochs=total_epochs,
+            train_stats=train_stats,
+            eval_stats=val_stats,
+            epoch_total_time=time.perf_counter() - epoch_started,
+        )
         _log_epoch_metrics(
             logger=logger,
             epoch=epoch,
+            total_epochs=total_epochs,
             train_metrics=train_metrics,
             val_metrics=val_metrics,
             lr=history_row["lr"],
@@ -544,7 +700,8 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
 
     best_state = _load_checkpoint_state(best_checkpoint_path)
     unwrap_model(model).load_state_dict(best_state["model"])
-    val_metrics, val_predictions = run_epoch(
+    logger.info("开始加载最佳 checkpoint 并执行最终验证。", extra=_phase_extra("SYSTEM"))
+    val_metrics, val_predictions, _ = run_epoch(
         model=model,
         loader=dataloaders["val"],
         criterion=criterion,
@@ -553,12 +710,15 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
         target_normalizer=normalizers["target"],
         train=False,
         relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
-        epoch=9999,
+        epoch=None,
         total_epochs=None,
         amp=use_amp,
         show_progress=show_progress,
         collect_predictions=True,
         logger=logger,
+        log_interval=log_interval,
+        lr_override=optimizer.param_groups[0]["lr"],
+        progress_label="best-val",
     )
     val_predictions.to_csv(run_dir / "val_predictions.csv", index=False)
     write_json(val_metrics, run_dir / "val_metrics.json")
@@ -572,7 +732,8 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
     test_metrics = None
     test_predictions = None
     if "test" in dataloaders:
-        test_metrics, test_predictions = run_epoch(
+        logger.info("开始执行 test 集评估。", extra=_phase_extra("SYSTEM"))
+        test_metrics, test_predictions, _ = run_epoch(
             model=model,
             loader=dataloaders["test"],
             criterion=criterion,
@@ -581,18 +742,22 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
             target_normalizer=normalizers["target"],
             train=False,
             relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
-            epoch=10000,
+            epoch=None,
             total_epochs=None,
             amp=use_amp,
             show_progress=show_progress,
             collect_predictions=True,
             logger=logger,
+            log_interval=log_interval,
+            lr_override=optimizer.param_groups[0]["lr"],
+            progress_label="test",
         )
         test_predictions.to_csv(run_dir / "test_predictions.csv", index=False)
         write_json(test_metrics, run_dir / "test_metrics.json")
         output["test_metrics"] = test_metrics
 
     try:
+        logger.info("开始生成训练报告文件。", extra=_phase_extra("SYSTEM"))
         report_summary = generate_training_report(
             output_dir=run_dir,
             history_df=history_df,
@@ -607,6 +772,7 @@ def train_main(config_path: str | Path, overrides: list[str] | None = None) -> d
             last_checkpoint_path=last_checkpoint_path,
         )
         output["best_summary"] = report_summary
+        logger.info("训练报告生成完成。", extra=_phase_extra("SYSTEM"))
     except Exception as exc:
         logger.exception("论文结果文件生成失败。")
         raise RuntimeError(f"训练已完成，但论文结果文件生成失败: {exc}") from exc
@@ -666,8 +832,9 @@ def evaluate_main(
     criterion = build_loss(config["training"]["loss"], config["training"]["smooth_l1_beta"])
     use_amp = device.type == "cuda" and bool(config["training"]["amp"])
     show_progress = bool(config["training"].get("progress_bar", True))
+    log_interval = _resolve_log_interval(config)
 
-    metrics, predictions = run_epoch(
+    metrics, predictions, _ = run_epoch(
         model=model,
         loader=dataloaders[split],
         criterion=criterion,
@@ -676,12 +843,14 @@ def evaluate_main(
         target_normalizer=normalizers["target"],
         train=False,
         relative_direction=config["model"].get("relative_target_direction", "boneage_minus_chronological"),
-        epoch=0,
+        epoch=None,
         total_epochs=None,
         amp=use_amp,
         show_progress=show_progress,
         collect_predictions=True,
         logger=logger,
+        log_interval=log_interval,
+        progress_label=split,
     )
     predictions.to_csv(run_dir / f"{split}_predictions.csv", index=False)
     write_json(metrics, run_dir / f"{split}_metrics.json")
@@ -758,10 +927,15 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
         if use_amp:
             scaler = torch.amp.GradScaler("cuda", enabled=True)
         show_progress = bool(trial_config["training"].get("progress_bar", True))
+        log_interval = _resolve_log_interval(trial_config)
+        total_epochs = int(trial_config["training"]["epochs"])
+        scheduler_name = str(trial_config["training"].get("scheduler") or "none").lower()
 
         best_metric = None
-        for epoch in range(1, int(trial_config["training"]["epochs"]) + 1):
-            train_metrics, _ = run_epoch(
+        for epoch in range(1, total_epochs + 1):
+            epoch_started = time.perf_counter()
+            _log_epoch_header(logger_trial, trial_config, optimizer, device, use_amp, epoch, total_epochs, log_interval)
+            train_metrics, _, train_stats = run_epoch(
                 model=model,
                 loader=dataloaders["train"],
                 criterion=criterion,
@@ -774,13 +948,15 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
                 scaler=scaler,
                 gradient_clip=float(trial_config["training"]["gradient_clip"]),
                 epoch=epoch,
-                total_epochs=int(trial_config["training"]["epochs"]),
+                total_epochs=total_epochs,
                 amp=use_amp,
                 show_progress=show_progress,
                 collect_predictions=False,
                 logger=logger_trial,
+                log_interval=log_interval,
             )
-            val_metrics, _ = run_epoch(
+            lr_before_scheduler = optimizer.param_groups[0]["lr"]
+            val_metrics, _, val_stats = run_epoch(
                 model=model,
                 loader=dataloaders["val"],
                 criterion=criterion,
@@ -790,11 +966,13 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
                 train=False,
                 relative_direction=trial_config["model"].get("relative_target_direction", "boneage_minus_chronological"),
                 epoch=epoch,
-                total_epochs=int(trial_config["training"]["epochs"]),
+                total_epochs=total_epochs,
                 amp=use_amp,
                 show_progress=show_progress,
                 collect_predictions=False,
                 logger=logger_trial,
+                log_interval=log_interval,
+                lr_override=lr_before_scheduler,
             )
             value = val_metrics["mae"] if val_metrics["mae"] is not None else 1e9
             trial.report(value, step=epoch)
@@ -803,12 +981,23 @@ def tune_main(config_path: str | Path, overrides: list[str] | None = None) -> di
                     scheduler.step(value)
                 else:
                     scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+            _log_learning_rate_update(logger_trial, scheduler_name, epoch, total_epochs, lr_before_scheduler, current_lr)
+            _log_epoch_timing(
+                logger=logger_trial,
+                epoch=epoch,
+                total_epochs=total_epochs,
+                train_stats=train_stats,
+                eval_stats=val_stats,
+                epoch_total_time=time.perf_counter() - epoch_started,
+            )
             _log_epoch_metrics(
                 logger=logger_trial,
                 epoch=epoch,
+                total_epochs=total_epochs,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,
-                lr=optimizer.param_groups[0]["lr"],
+                lr=current_lr,
             )
             best_metric = value if best_metric is None else min(best_metric, value)
             if trial.should_prune():

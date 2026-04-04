@@ -82,6 +82,7 @@ training:
   best_metric: mae
   resume_checkpoint: null
   progress_bar: true
+  log_interval: 20
   workers_override: null
   prefetch_factor: null
   persistent_workers: null

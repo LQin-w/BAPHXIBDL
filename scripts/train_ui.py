@@ -125,6 +125,7 @@ OPTION_META: dict[str, tuple[str, str]] = {
     "training.best_metric": ("最佳模型指标", "用于保存 best checkpoint 的验证指标名。"),
     "training.resume_checkpoint": ("续训 checkpoint", "从指定 checkpoint 恢复训练。"),
     "training.progress_bar": ("进度条开关", "是否显示 epoch 内 batch 进度条。"),
+    "training.log_interval": ("日志间隔", "每隔多少个 batch 输出一次批次日志；0 表示仅输出首尾 batch。"),
     "training.workers_override": ("DataLoader 线程覆盖", "手动指定 DataLoader num_workers。"),
     "training.prefetch_factor": ("预取因子", "每个 worker 预取 batch 数。"),
     "training.persistent_workers": ("常驻 worker", "epoch 间保持 DataLoader worker 常驻。"),
