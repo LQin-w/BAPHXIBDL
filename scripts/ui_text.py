@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+import re
+from typing import Any
+
+
+LANGUAGES: tuple[str, ...] = ("zh", "en")
+DEFAULT_LANGUAGE = "zh"
+
+TEXTS: dict[str, dict[str, str]] = {
+    "zh": {
+        "window.title": "RHPE BoneAge Training UI",
+        "top.config_file": "配置文件",
+        "top.select_file": "选择文件",
+        "top.save_config": "保存配置",
+        "top.reload": "重新加载",
+        "top.select_resume": "选择续训点",
+        "top.clear_resume": "清空续训",
+        "top.language": "语言",
+        "language.option.zh": "中文",
+        "language.option.en": "English",
+        "panel.training_output": "训练输出",
+        "panel.output_streams": "stdout / stderr / logger",
+        "button.clear_output": "清空输出",
+        "button.start_training": "开始训练",
+        "button.stop_training": "停止训练",
+        "button.stopping": "正在停止...",
+        "button.reset_defaults": "恢复默认值",
+        "status.ready": "就绪",
+        "status.resume_selected": "已选择续训 checkpoint: {path}",
+        "status.resume_cleared": "已清空续训 checkpoint，将从头开始训练。",
+        "status.save_cancelled": "已取消保存配置。",
+        "status.config_saved": "配置已保存到: {path}",
+        "status.config_loaded_summary": "已加载 {visible_count} 个训练参数，补全 {default_count} 个默认参数，隐藏 {hidden_count} 个当前训练模式不生效的参数。",
+        "status.defaults_restored": "参数已恢复为配置默认值。",
+        "status.training_stopped": "训练已停止。",
+        "status.training_finished": "训练完成。输出目录: {run_dir}",
+        "status.training_failed": "训练失败。",
+        "status.stop_requested": "正在请求停止训练...",
+        "status.training_starting": "训练启动中...",
+        "log.tk_encoding": "[UI] Tcl/Tk system encoding: {encoding}\n",
+        "log.font_enabled": "[UI] 已启用中文字体: {font}\n",
+        "log.font_default": "[UI] 未找到显式中文字体，当前使用 Tk 默认字体。\n",
+        "log.window_close_stop_requested": "[UI] 检测到窗口关闭请求，已先请求停止训练，请等待任务退出。\n",
+        "log.language_switched": "[UI] 界面语言已切换为: {language}\n",
+        "log.training_stopped": "\n[UI] 训练已停止: {reason}\n",
+        "log.training_finished": "\n[UI] 训练完成，输出目录: {run_dir}\n",
+        "log.training_failed": "\n[UI] 训练失败: {error}\n",
+        "log.user_stop_requested": "[UI] 用户请求停止训练 | phase={phase} | scope={scope}\n",
+        "log.training_start_banner": "\n{separator}\n[UI] 启动训练 | config={config_path} | overrides={override_count}\n",
+        "log.override": "[UI] override | {item}\n",
+        "dialog.config_error_title": "配置错误",
+        "dialog.save_failed_title": "保存失败",
+        "dialog.config_not_found_title": "配置文件不存在",
+        "dialog.read_failed_title": "读取失败",
+        "dialog.training_complete_title": "训练完成",
+        "dialog.training_failed_title": "训练失败",
+        "dialog.rename_config_title": "重命名配置文件",
+        "dialog.rename_config_prompt": "请输入保存文件名：",
+        "dialog.no_save_path": "当前没有可保存的配置文件路径。",
+        "dialog.empty_file_name": "文件名不能为空。",
+        "dialog.save_failed_detail": "无法保存配置文件:\n{error}",
+        "dialog.config_not_found_detail": "找不到配置文件: {path}",
+        "dialog.read_failed_detail": "无法读取配置文件:\n{error}",
+        "dialog.training_complete_detail": "训练已完成。\n输出目录:\n{run_dir}",
+        "dialog.config_path_missing_detail": "配置文件不存在: {path}",
+        "form.header.path": "配置路径",
+        "form.header.name": "中文名称",
+        "form.header.value": "参数取值",
+        "form.header.description": "参数释义",
+        "file_dialog.select_config": "选择配置文件",
+        "file_dialog.select_resume": "选择续训 checkpoint",
+        "filetype.yaml": "YAML 文件",
+        "filetype.all": "所有文件",
+        "filetype.checkpoint": "PyTorch checkpoints",
+        "error.config_root_dict": "配置文件顶层必须是字典: {path}",
+        "error.form_field_missing": "表单中不存在配置项: {key}",
+        "error.value_not_allowed": "{key} 仅支持以下取值: {allowed}",
+        "error.null_not_allowed": "{key} 不能设置为 null，请填写有效值或恢复默认值。",
+        "option.custom_desc": "自定义参数 `{path}`。该值会在点击开始训练时作为配置覆盖项传入。",
+        "cli.description": "训练前 UI 参数配置面板",
+        "cli.help.config": "配置文件路径",
+        "cli.help.set": "覆盖配置，格式 key=value",
+        "cli.help.auto_run": "不启动图形界面，直接按当前参数启动训练",
+    },
+    "en": {
+        "window.title": "RHPE BoneAge Training UI",
+        "top.config_file": "Config File",
+        "top.select_file": "Browse",
+        "top.save_config": "Save Config",
+        "top.reload": "Reload",
+        "top.select_resume": "Select Resume Checkpoint",
+        "top.clear_resume": "Clear Resume",
+        "top.language": "Language",
+        "language.option.zh": "Chinese",
+        "language.option.en": "English",
+        "panel.training_output": "Training Output",
+        "panel.output_streams": "stdout / stderr / logger",
+        "button.clear_output": "Clear Output",
+        "button.start_training": "Start Training",
+        "button.stop_training": "Stop Training",
+        "button.stopping": "Stopping...",
+        "button.reset_defaults": "Restore Defaults",
+        "status.ready": "Ready",
+        "status.resume_selected": "Selected resume checkpoint: {path}",
+        "status.resume_cleared": "Resume checkpoint cleared. Training will start from scratch.",
+        "status.save_cancelled": "Config save cancelled.",
+        "status.config_saved": "Config saved to: {path}",
+        "status.config_loaded_summary": "Loaded {visible_count} training parameters, filled {default_count} defaults, and hid {hidden_count} parameters that are inactive in the current training mode.",
+        "status.defaults_restored": "Parameters restored to config defaults.",
+        "status.training_stopped": "Training stopped.",
+        "status.training_finished": "Training finished. Output directory: {run_dir}",
+        "status.training_failed": "Training failed.",
+        "status.stop_requested": "Stop requested...",
+        "status.training_starting": "Starting training...",
+        "log.tk_encoding": "[UI] Tcl/Tk system encoding: {encoding}\n",
+        "log.font_enabled": "[UI] Active CJK-capable font: {font}\n",
+        "log.font_default": "[UI] No explicit CJK font found. Tk default font is in use.\n",
+        "log.window_close_stop_requested": "[UI] Window close requested. Training stop was requested first. Please wait for the task to exit.\n",
+        "log.language_switched": "[UI] UI language switched to: {language}\n",
+        "log.training_stopped": "\n[UI] Training stopped: {reason}\n",
+        "log.training_finished": "\n[UI] Training finished. Output directory: {run_dir}\n",
+        "log.training_failed": "\n[UI] Training failed: {error}\n",
+        "log.user_stop_requested": "[UI] User requested stop | phase={phase} | scope={scope}\n",
+        "log.training_start_banner": "\n{separator}\n[UI] Starting training | config={config_path} | overrides={override_count}\n",
+        "log.override": "[UI] override | {item}\n",
+        "dialog.config_error_title": "Config Error",
+        "dialog.save_failed_title": "Save Failed",
+        "dialog.config_not_found_title": "Config File Not Found",
+        "dialog.read_failed_title": "Read Failed",
+        "dialog.training_complete_title": "Training Complete",
+        "dialog.training_failed_title": "Training Failed",
+        "dialog.rename_config_title": "Rename Config File",
+        "dialog.rename_config_prompt": "Enter the file name to save:",
+        "dialog.no_save_path": "There is no config path available to save.",
+        "dialog.empty_file_name": "File name cannot be empty.",
+        "dialog.save_failed_detail": "Unable to save config file:\n{error}",
+        "dialog.config_not_found_detail": "Cannot find config file: {path}",
+        "dialog.read_failed_detail": "Unable to read config file:\n{error}",
+        "dialog.training_complete_detail": "Training finished.\nOutput directory:\n{run_dir}",
+        "dialog.config_path_missing_detail": "Config file does not exist: {path}",
+        "form.header.path": "Config Path",
+        "form.header.name": "Display Name",
+        "form.header.value": "Value",
+        "form.header.description": "Description",
+        "file_dialog.select_config": "Select Config File",
+        "file_dialog.select_resume": "Select Resume Checkpoint",
+        "filetype.yaml": "YAML files",
+        "filetype.all": "All files",
+        "filetype.checkpoint": "PyTorch checkpoints",
+        "error.config_root_dict": "Config root must be a mapping: {path}",
+        "error.form_field_missing": "Form field does not exist: {key}",
+        "error.value_not_allowed": "{key} only supports the following values: {allowed}",
+        "error.null_not_allowed": "{key} cannot be set to null. Enter a valid value or restore the default.",
+        "option.custom_desc": "Custom parameter `{path}`. This value will be passed as a config override when training starts.",
+        "cli.description": "Pre-training UI parameter panel",
+        "cli.help.config": "Path to the config file",
+        "cli.help.set": "Override config values in key=value form",
+        "cli.help.auto_run": "Run training directly without opening the GUI",
+    },
+}
+
+OPTION_TEXTS: dict[str, dict[str, dict[str, str]]] = {
+    "zh": {
+        "experiment.name": {"name": "实验名称", "desc": "本次实验的名称前缀，用于输出目录与日志标识。"},
+        "experiment.output_root": {"name": "输出根目录", "desc": "训练产物保存的根目录。"},
+        "experiment.seed": {"name": "随机种子", "desc": "控制随机性，保证实验可复现。"},
+        "runtime.device": {"name": "运行设备", "desc": "训练使用的设备，例如 cuda:0 或 cpu。"},
+        "runtime.allow_cpu_fallback": {"name": "允许回退 CPU", "desc": "当请求 GPU 不可用时，是否自动回退到 CPU。"},
+        "data.dataset_root": {"name": "数据集根目录", "desc": "数据集所在根路径。"},
+        "data.input_size": {"name": "输入分辨率", "desc": "全局输入图像 resize 的边长。"},
+        "data.local_patch_size": {"name": "局部 patch 尺寸", "desc": "关键点局部裁剪 patch 的边长。"},
+        "data.max_keypoints": {"name": "最大关键点数", "desc": "单样本使用的关键点上限。"},
+        "data.heatmap_sigma_ratio": {"name": "热图 sigma 比例", "desc": "关键点热图高斯核与手部尺度的比例。"},
+        "data.global_crop_mode": {"name": "全局裁剪模式", "desc": "全局图像裁剪策略。"},
+        "data.global_crop_margin_ratio": {"name": "全局裁剪边距比例", "desc": "基于 bbox 裁剪时额外保留的上下文比例。"},
+        "data.verify_images": {"name": "图像有效性检查", "desc": "构建索引时是否逐张检查图像可读性。"},
+        "model.ensemble_mode": {"name": "集成模式", "desc": "选择 ResNet / EfficientNet / 双模型集成。"},
+        "model.resnet_name": {"name": "ResNet 主干", "desc": "全局分支使用的 ResNet 版本。"},
+        "model.efficientnet_name": {"name": "EfficientNet 主干", "desc": "全局分支使用的 EfficientNet 版本。"},
+        "model.pretrained": {"name": "使用预训练权重", "desc": "是否加载 torchvision 预训练权重。"},
+        "model.branch_mode": {"name": "分支模式", "desc": "使用全局分支、局部分支或两者联合。"},
+        "model.target_mode": {"name": "目标模式", "desc": "直接预测骨龄或预测相对骨龄偏差。"},
+        "model.relative_target_direction": {"name": "相对骨龄方向", "desc": "相对目标的正负方向定义。"},
+        "model.global_dim": {"name": "全局特征维度", "desc": "全局分支投影后的特征维度。"},
+        "model.heatmap_guidance.enabled": {"name": "热图引导开关", "desc": "是否在全局分支使用 heatmap 引导特征。"},
+        "model.cbam.enabled": {"name": "CBAM 总开关", "desc": "是否启用 CBAM 注意力模块。"},
+        "model.cbam.global_branch": {"name": "全局 CBAM", "desc": "是否在全局分支启用 CBAM。"},
+        "model.cbam.local_branch": {"name": "局部 CBAM", "desc": "是否在局部分支启用 CBAM。"},
+        "model.metadata.enabled": {"name": "元信息融合开关", "desc": "是否融合性别和真实年龄等元信息。"},
+        "model.metadata.mode": {"name": "元信息融合模式", "desc": "元信息编码策略（SIMBA 相关变体）。"},
+        "model.metadata.hidden_dim": {"name": "元信息隐藏维度", "desc": "元信息 MLP 的隐藏层维度。"},
+        "model.metadata.gender_embedding_dim": {"name": "性别嵌入维度", "desc": "性别 embedding 维度。"},
+        "model.metadata.chronological_hidden_dim": {"name": "年龄特征维度", "desc": "真实年龄投影后的特征维度。"},
+        "model.metadata.dropout": {"name": "元信息 dropout", "desc": "元信息分支的 dropout 比例。"},
+        "model.local_branch.mode": {"name": "局部分支输入模式", "desc": "局部分支使用 patch、heatmap 或二者拼接。"},
+        "model.local_branch.feature_dim": {"name": "局部特征维度", "desc": "局部分支输出特征维度。"},
+        "model.local_branch.geometry_dim": {"name": "几何特征维度", "desc": "ROI 几何编码向量维度。"},
+        "model.local_branch.dropout": {"name": "局部分支 dropout", "desc": "局部分支融合层 dropout 比例。"},
+        "model.head.hidden_dim": {"name": "回归头隐藏维度", "desc": "最终融合回归头的隐藏层维度。"},
+        "model.head.dropout": {"name": "回归头 dropout", "desc": "最终回归头的 dropout 比例。"},
+        "augmentation.affine_p": {"name": "仿射增强概率", "desc": "随机仿射变换执行概率。"},
+        "augmentation.rotation_limit": {"name": "旋转范围", "desc": "仿射增强旋转角度上限（度）。"},
+        "augmentation.translate_limit": {"name": "平移范围", "desc": "仿射增强平移比例上限。"},
+        "augmentation.scale_limit": {"name": "缩放范围", "desc": "仿射增强缩放比例上限。"},
+        "augmentation.shear_limit": {"name": "错切范围", "desc": "仿射增强错切角度上限。"},
+        "augmentation.horizontal_flip": {"name": "水平翻转", "desc": "是否在训练中启用随机水平翻转。"},
+        "augmentation.use_noise": {"name": "高斯噪声开关", "desc": "是否启用高斯噪声增强。"},
+        "augmentation.noise_std_min": {"name": "噪声下限", "desc": "高斯噪声标准差最小值。"},
+        "augmentation.noise_std_max": {"name": "噪声上限", "desc": "高斯噪声标准差最大值。"},
+        "augmentation.noise_p": {"name": "噪声概率", "desc": "高斯噪声增强执行概率。"},
+        "augmentation.use_blur": {"name": "模糊增强开关", "desc": "是否启用高斯模糊增强。"},
+        "augmentation.blur_limit": {"name": "模糊核上限", "desc": "高斯模糊 kernel 尺寸上限。"},
+        "augmentation.blur_p": {"name": "模糊概率", "desc": "高斯模糊增强执行概率。"},
+        "training.epochs": {"name": "训练轮数", "desc": "完整遍历训练集的轮次数。"},
+        "training.batch_size": {"name": "训练 batch 大小", "desc": "训练集 DataLoader 的 batch size。"},
+        "training.val_batch_size": {"name": "验证 batch 大小", "desc": "验证集 DataLoader 的 batch size。"},
+        "training.test_batch_size": {"name": "测试 batch 大小", "desc": "测试集 DataLoader 的 batch size。"},
+        "training.optimizer": {"name": "优化器", "desc": "训练使用的优化算法。"},
+        "training.lr": {"name": "学习率", "desc": "优化器初始学习率。"},
+        "training.weight_decay": {"name": "权重衰减", "desc": "L2 正则化强度。"},
+        "training.momentum": {"name": "动量", "desc": "SGD 优化器使用的动量参数。"},
+        "training.scheduler": {"name": "学习率调度器", "desc": "学习率衰减策略。"},
+        "training.min_lr": {"name": "最小学习率", "desc": "调度器允许下降到的最小学习率。"},
+        "training.loss": {"name": "损失函数", "desc": "回归训练使用的损失函数。"},
+        "training.smooth_l1_beta": {"name": "SmoothL1 beta", "desc": "SmoothL1 损失的 beta 参数。"},
+        "training.amp": {"name": "混合精度训练", "desc": "是否启用 AMP 以提高吞吐并降低显存。"},
+        "training.gradient_clip": {"name": "梯度裁剪阈值", "desc": "梯度范数裁剪上限，0 或 null 表示关闭。"},
+        "training.compile": {"name": "torch.compile", "desc": "是否对模型进行编译优化。"},
+        "training.best_metric": {"name": "最佳模型指标", "desc": "用于保存 best checkpoint 的验证指标名。"},
+        "training.resume_checkpoint": {"name": "续训 checkpoint", "desc": "从指定 checkpoint 恢复训练。"},
+        "training.progress_bar": {"name": "进度条开关", "desc": "是否显示 epoch 内 batch 进度条。"},
+        "training.log_interval": {"name": "日志间隔", "desc": "每隔多少个 batch 输出一次批次日志；0 表示仅输出首尾 batch。"},
+        "training.workers_override": {"name": "DataLoader 线程覆盖", "desc": "手动指定 DataLoader num_workers。"},
+        "training.prefetch_factor": {"name": "预取因子", "desc": "每个 worker 预取 batch 数。"},
+        "training.persistent_workers": {"name": "常驻 worker", "desc": "epoch 间保持 DataLoader worker 常驻。"},
+        "training.pin_memory": {"name": "固定内存", "desc": "是否启用 pin_memory 加速主机到 GPU 拷贝。"},
+        "debug.limit_train_samples": {"name": "训练样本限制", "desc": "仅用于调试，限制训练样本数量。"},
+        "debug.limit_val_samples": {"name": "验证样本限制", "desc": "仅用于调试，限制验证样本数量。"},
+        "debug.limit_test_samples": {"name": "测试样本限制", "desc": "仅用于调试，限制测试样本数量。"},
+        "optuna.direction": {"name": "调参优化方向", "desc": "Optuna 目标方向，minimize 或 maximize。"},
+        "optuna.n_trials": {"name": "调参试验次数", "desc": "Optuna 运行的 trial 总数。"},
+        "optuna.timeout": {"name": "调参超时时间", "desc": "Optuna 总超时（秒），null 表示不限制。"},
+        "optuna.epochs_per_trial": {"name": "每轮 trial epoch 数", "desc": "每个 Optuna trial 的训练 epoch 数。"},
+    },
+    "en": {
+        "experiment.name": {"name": "Experiment Name", "desc": "Name prefix for this run, used in the output directory and logs."},
+        "experiment.output_root": {"name": "Output Root", "desc": "Root directory for training outputs."},
+        "experiment.seed": {"name": "Random Seed", "desc": "Controls randomness to keep experiments reproducible."},
+        "runtime.device": {"name": "Runtime Device", "desc": "Device used for training, such as cuda:0 or cpu."},
+        "runtime.allow_cpu_fallback": {"name": "Allow CPU Fallback", "desc": "Whether to fall back to CPU automatically when the requested GPU is unavailable."},
+        "data.dataset_root": {"name": "Dataset Root", "desc": "Root path of the dataset."},
+        "data.input_size": {"name": "Input Resolution", "desc": "Resize size for the global input image."},
+        "data.local_patch_size": {"name": "Local Patch Size", "desc": "Side length of the local keypoint crop patch."},
+        "data.max_keypoints": {"name": "Max Keypoints", "desc": "Maximum number of keypoints used per sample."},
+        "data.heatmap_sigma_ratio": {"name": "Heatmap Sigma Ratio", "desc": "Ratio between the heatmap Gaussian kernel and the hand scale."},
+        "data.global_crop_mode": {"name": "Global Crop Mode", "desc": "Cropping strategy for the global image branch."},
+        "data.global_crop_margin_ratio": {"name": "Global Crop Margin Ratio", "desc": "Extra context ratio kept when cropping from the bounding box."},
+        "data.verify_images": {"name": "Image Validation", "desc": "Whether to verify that each image can be read when building the index."},
+        "model.ensemble_mode": {"name": "Ensemble Mode", "desc": "Choose ResNet, EfficientNet, or the dual-model ensemble."},
+        "model.resnet_name": {"name": "ResNet Backbone", "desc": "ResNet variant used by the global branch."},
+        "model.efficientnet_name": {"name": "EfficientNet Backbone", "desc": "EfficientNet variant used by the global branch."},
+        "model.pretrained": {"name": "Use Pretrained Weights", "desc": "Whether to load torchvision pretrained weights."},
+        "model.branch_mode": {"name": "Branch Mode", "desc": "Use the global branch, local branch, or both."},
+        "model.target_mode": {"name": "Target Mode", "desc": "Predict bone age directly or predict a relative bone age offset."},
+        "model.relative_target_direction": {"name": "Relative Target Direction", "desc": "Sign convention used for the relative target."},
+        "model.global_dim": {"name": "Global Feature Dim", "desc": "Projected feature dimension of the global branch."},
+        "model.heatmap_guidance.enabled": {"name": "Heatmap Guidance", "desc": "Whether to use heatmap-guided features in the global branch."},
+        "model.cbam.enabled": {"name": "CBAM Master Switch", "desc": "Whether to enable the CBAM attention module."},
+        "model.cbam.global_branch": {"name": "Global CBAM", "desc": "Whether to enable CBAM in the global branch."},
+        "model.cbam.local_branch": {"name": "Local CBAM", "desc": "Whether to enable CBAM in the local branch."},
+        "model.metadata.enabled": {"name": "Metadata Fusion", "desc": "Whether to fuse metadata such as sex and chronological age."},
+        "model.metadata.mode": {"name": "Metadata Fusion Mode", "desc": "Metadata encoding strategy, including SIMBA-related variants."},
+        "model.metadata.hidden_dim": {"name": "Metadata Hidden Dim", "desc": "Hidden dimension of the metadata MLP."},
+        "model.metadata.gender_embedding_dim": {"name": "Gender Embedding Dim", "desc": "Embedding dimension used for sex metadata."},
+        "model.metadata.chronological_hidden_dim": {"name": "Age Feature Dim", "desc": "Feature dimension after projecting chronological age."},
+        "model.metadata.dropout": {"name": "Metadata Dropout", "desc": "Dropout ratio for the metadata branch."},
+        "model.local_branch.mode": {"name": "Local Branch Input Mode", "desc": "Whether the local branch uses patches, heatmaps, or both."},
+        "model.local_branch.feature_dim": {"name": "Local Feature Dim", "desc": "Output feature dimension of the local branch."},
+        "model.local_branch.geometry_dim": {"name": "Geometry Feature Dim", "desc": "Dimension of the ROI geometry encoding vector."},
+        "model.local_branch.dropout": {"name": "Local Branch Dropout", "desc": "Dropout ratio in the local branch fusion layer."},
+        "model.head.hidden_dim": {"name": "Head Hidden Dim", "desc": "Hidden dimension of the final regression head."},
+        "model.head.dropout": {"name": "Head Dropout", "desc": "Dropout ratio of the final regression head."},
+        "augmentation.affine_p": {"name": "Affine Augmentation Prob", "desc": "Execution probability for random affine augmentation."},
+        "augmentation.rotation_limit": {"name": "Rotation Range", "desc": "Maximum rotation angle for affine augmentation in degrees."},
+        "augmentation.translate_limit": {"name": "Translation Range", "desc": "Maximum translation ratio for affine augmentation."},
+        "augmentation.scale_limit": {"name": "Scale Range", "desc": "Maximum scaling ratio for affine augmentation."},
+        "augmentation.shear_limit": {"name": "Shear Range", "desc": "Maximum shear angle for affine augmentation."},
+        "augmentation.horizontal_flip": {"name": "Horizontal Flip", "desc": "Whether to enable random horizontal flips during training."},
+        "augmentation.use_noise": {"name": "Gaussian Noise Switch", "desc": "Whether to enable Gaussian noise augmentation."},
+        "augmentation.noise_std_min": {"name": "Noise Std Min", "desc": "Minimum standard deviation of the Gaussian noise."},
+        "augmentation.noise_std_max": {"name": "Noise Std Max", "desc": "Maximum standard deviation of the Gaussian noise."},
+        "augmentation.noise_p": {"name": "Noise Probability", "desc": "Execution probability of the Gaussian noise augmentation."},
+        "augmentation.use_blur": {"name": "Blur Switch", "desc": "Whether to enable Gaussian blur augmentation."},
+        "augmentation.blur_limit": {"name": "Blur Kernel Max", "desc": "Maximum Gaussian blur kernel size."},
+        "augmentation.blur_p": {"name": "Blur Probability", "desc": "Execution probability of the Gaussian blur augmentation."},
+        "training.epochs": {"name": "Epochs", "desc": "Number of full passes through the training set."},
+        "training.batch_size": {"name": "Train Batch Size", "desc": "Batch size of the training DataLoader."},
+        "training.val_batch_size": {"name": "Validation Batch Size", "desc": "Batch size of the validation DataLoader."},
+        "training.test_batch_size": {"name": "Test Batch Size", "desc": "Batch size of the test DataLoader."},
+        "training.optimizer": {"name": "Optimizer", "desc": "Optimization algorithm used for training."},
+        "training.lr": {"name": "Learning Rate", "desc": "Initial learning rate of the optimizer."},
+        "training.weight_decay": {"name": "Weight Decay", "desc": "L2 regularization strength."},
+        "training.momentum": {"name": "Momentum", "desc": "Momentum parameter used by the SGD optimizer."},
+        "training.scheduler": {"name": "Scheduler", "desc": "Learning rate decay strategy."},
+        "training.min_lr": {"name": "Minimum Learning Rate", "desc": "Lower bound allowed by the scheduler."},
+        "training.loss": {"name": "Loss Function", "desc": "Regression loss used during training."},
+        "training.smooth_l1_beta": {"name": "SmoothL1 Beta", "desc": "Beta parameter of the SmoothL1 loss."},
+        "training.amp": {"name": "Mixed Precision", "desc": "Whether to enable AMP to improve throughput and reduce memory usage."},
+        "training.gradient_clip": {"name": "Gradient Clip", "desc": "Maximum gradient norm. Set to 0 or null to disable."},
+        "training.compile": {"name": "torch.compile", "desc": "Whether to compile the model for optimization."},
+        "training.best_metric": {"name": "Best Metric", "desc": "Validation metric used to save the best checkpoint."},
+        "training.resume_checkpoint": {"name": "Resume Checkpoint", "desc": "Resume training from the specified checkpoint."},
+        "training.progress_bar": {"name": "Progress Bar", "desc": "Whether to show the batch progress bar inside each epoch."},
+        "training.log_interval": {"name": "Log Interval", "desc": "Write one batch log every N batches. Set to 0 to log only the first and last batch."},
+        "training.workers_override": {"name": "DataLoader Worker Override", "desc": "Manually override the DataLoader num_workers setting."},
+        "training.prefetch_factor": {"name": "Prefetch Factor", "desc": "Number of batches prefetched by each worker."},
+        "training.persistent_workers": {"name": "Persistent Workers", "desc": "Keep DataLoader workers alive across epochs."},
+        "training.pin_memory": {"name": "Pin Memory", "desc": "Whether to use pin_memory to speed up host-to-GPU transfer."},
+        "debug.limit_train_samples": {"name": "Train Sample Limit", "desc": "Debug-only limit for the number of training samples."},
+        "debug.limit_val_samples": {"name": "Validation Sample Limit", "desc": "Debug-only limit for the number of validation samples."},
+        "debug.limit_test_samples": {"name": "Test Sample Limit", "desc": "Debug-only limit for the number of test samples."},
+        "optuna.direction": {"name": "Optimization Direction", "desc": "Optuna objective direction, either minimize or maximize."},
+        "optuna.n_trials": {"name": "Number of Trials", "desc": "Total number of Optuna trials to run."},
+        "optuna.timeout": {"name": "Tuning Timeout", "desc": "Total Optuna timeout in seconds. Null means unlimited."},
+        "optuna.epochs_per_trial": {"name": "Epochs per Trial", "desc": "Number of epochs run for each Optuna trial."},
+    },
+}
+
+FALLBACK_FIELD_NAMES: dict[str, dict[str, str]] = {
+    "zh": {
+        "name": "名称",
+        "enabled": "开关",
+        "mode": "模式",
+        "dropout": "Dropout",
+        "hidden_dim": "隐藏维度",
+        "device": "设备",
+        "epochs": "轮数",
+        "batch_size": "批大小",
+        "lr": "学习率",
+    },
+    "en": {
+        "name": "Name",
+        "enabled": "Enabled",
+        "mode": "Mode",
+        "dropout": "Dropout",
+        "hidden_dim": "Hidden Dim",
+        "device": "Device",
+        "epochs": "Epochs",
+        "batch_size": "Batch Size",
+        "lr": "Learning Rate",
+    },
+}
+
+_UNICODE_ESCAPE_PATTERN = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
+
+
+def normalize_visible_text(value: str) -> str:
+    if "\\u" not in value and "\\U" not in value:
+        return value
+
+    def _replace(match: re.Match[str]) -> str:
+        u16, u32 = match.groups()
+        if u16 is not None:
+            return chr(int(u16, 16))
+        if u32 is not None:
+            return chr(int(u32, 16))
+        return match.group(0)
+
+    normalized = value
+    for _ in range(2):
+        updated = _UNICODE_ESCAPE_PATTERN.sub(_replace, normalized)
+        if updated == normalized:
+            break
+        normalized = updated
+    return normalized
+
+
+class UITextManager:
+    def __init__(self, language: str = DEFAULT_LANGUAGE) -> None:
+        self._language = DEFAULT_LANGUAGE
+        self.set_language(language)
+
+    def get_language(self) -> str:
+        return self._language
+
+    def set_language(self, language: str) -> None:
+        if language not in LANGUAGES:
+            raise ValueError(f"Unsupported UI language: {language}")
+        self._language = language
+
+    def get_languages(self) -> tuple[str, ...]:
+        return LANGUAGES
+
+    def get_text(self, key: str, /, **kwargs: Any) -> str:
+        template = TEXTS.get(self._language, {}).get(key)
+        if template is None:
+            template = TEXTS[DEFAULT_LANGUAGE].get(key, key)
+        template = normalize_visible_text(template)
+        if kwargs:
+            try:
+                template = template.format(**kwargs)
+            except Exception:
+                pass
+        return normalize_visible_text(template)
+
+    def get_language_label(self, language: str) -> str:
+        return self.get_text(f"language.option.{language}")
+
+    def get_option_meta(self, path: str) -> tuple[str, str]:
+        option_text = OPTION_TEXTS.get(self._language, {}).get(path)
+        if option_text is None:
+            option_text = OPTION_TEXTS[DEFAULT_LANGUAGE].get(path)
+        if option_text is not None:
+            return (
+                normalize_visible_text(option_text["name"]),
+                normalize_visible_text(option_text["desc"]),
+            )
+
+        key = path.split(".")[-1]
+        fallback_name = FALLBACK_FIELD_NAMES.get(self._language, {}).get(
+            key,
+            FALLBACK_FIELD_NAMES[DEFAULT_LANGUAGE].get(key, key),
+        )
+        fallback_desc = self.get_text("option.custom_desc", path=path)
+        return normalize_visible_text(fallback_name), normalize_visible_text(fallback_desc)

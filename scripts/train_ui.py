@@ -19,8 +19,10 @@ import yaml
 
 try:
     from _bootstrap import bootstrap, run_cli
+    from ui_text import UITextManager, normalize_visible_text
 except ModuleNotFoundError:
     from scripts._bootstrap import bootstrap, run_cli
+    from scripts.ui_text import UITextManager, normalize_visible_text
 
 
 PRESET_OPTIONS: dict[str, list[str]] = {
@@ -91,101 +93,12 @@ FONT_CANDIDATES_MONO: tuple[str, ...] = (
     "Heiti SC",
     "SimHei",
 )
-
-OPTION_META: dict[str, tuple[str, str]] = {
-    "experiment.name": ("实验名称", "本次实验的名称前缀，用于输出目录与日志标识。"),
-    "experiment.output_root": ("输出根目录", "训练产物保存的根目录。"),
-    "experiment.seed": ("随机种子", "控制随机性，保证实验可复现。"),
-    "runtime.device": ("运行设备", "训练使用的设备，例如 cuda:0 或 cpu。"),
-    "runtime.allow_cpu_fallback": ("允许回退 CPU", "当请求 GPU 不可用时，是否自动回退到 CPU。"),
-    "data.dataset_root": ("数据集根目录", "数据集所在根路径。"),
-    "data.input_size": ("输入分辨率", "全局输入图像 resize 的边长。"),
-    "data.local_patch_size": ("局部 patch 尺寸", "关键点局部裁剪 patch 的边长。"),
-    "data.max_keypoints": ("最大关键点数", "单样本使用的关键点上限。"),
-    "data.heatmap_sigma_ratio": ("热图 sigma 比例", "关键点热图高斯核与手部尺度的比例。"),
-    "data.global_crop_mode": ("全局裁剪模式", "全局图像裁剪策略。"),
-    "data.global_crop_margin_ratio": ("全局裁剪边距比例", "基于 bbox 裁剪时额外保留的上下文比例。"),
-    "data.verify_images": ("图像有效性检查", "构建索引时是否逐张检查图像可读性。"),
-    "model.ensemble_mode": ("集成模式", "选择 ResNet / EfficientNet / 双模型集成。"),
-    "model.resnet_name": ("ResNet 主干", "全局分支使用的 ResNet 版本。"),
-    "model.efficientnet_name": ("EfficientNet 主干", "全局分支使用的 EfficientNet 版本。"),
-    "model.pretrained": ("使用预训练权重", "是否加载 torchvision 预训练权重。"),
-    "model.branch_mode": ("分支模式", "使用全局分支、局部分支或两者联合。"),
-    "model.target_mode": ("目标模式", "直接预测骨龄或预测相对骨龄偏差。"),
-    "model.relative_target_direction": ("相对骨龄方向", "相对目标的正负方向定义。"),
-    "model.global_dim": ("全局特征维度", "全局分支投影后的特征维度。"),
-    "model.heatmap_guidance.enabled": ("热图引导开关", "是否在全局分支使用 heatmap 引导特征。"),
-    "model.cbam.enabled": ("CBAM 总开关", "是否启用 CBAM 注意力模块。"),
-    "model.cbam.global_branch": ("全局 CBAM", "是否在全局分支启用 CBAM。"),
-    "model.cbam.local_branch": ("局部 CBAM", "是否在局部分支启用 CBAM。"),
-    "model.metadata.enabled": ("元信息融合开关", "是否融合性别和真实年龄等元信息。"),
-    "model.metadata.mode": ("元信息融合模式", "元信息编码策略（SIMBA 相关变体）。"),
-    "model.metadata.hidden_dim": ("元信息隐藏维度", "元信息 MLP 的隐藏层维度。"),
-    "model.metadata.gender_embedding_dim": ("性别嵌入维度", "性别 embedding 维度。"),
-    "model.metadata.chronological_hidden_dim": ("年龄特征维度", "真实年龄投影后的特征维度。"),
-    "model.metadata.dropout": ("元信息 dropout", "元信息分支的 dropout 比例。"),
-    "model.local_branch.mode": ("局部分支输入模式", "局部分支使用 patch、heatmap 或二者拼接。"),
-    "model.local_branch.feature_dim": ("局部特征维度", "局部分支输出特征维度。"),
-    "model.local_branch.geometry_dim": ("几何特征维度", "ROI 几何编码向量维度。"),
-    "model.local_branch.dropout": ("局部分支 dropout", "局部分支融合层 dropout 比例。"),
-    "model.head.hidden_dim": ("回归头隐藏维度", "最终融合回归头的隐藏层维度。"),
-    "model.head.dropout": ("回归头 dropout", "最终回归头的 dropout 比例。"),
-    "augmentation.affine_p": ("仿射增强概率", "随机仿射变换执行概率。"),
-    "augmentation.rotation_limit": ("旋转范围", "仿射增强旋转角度上限（度）。"),
-    "augmentation.translate_limit": ("平移范围", "仿射增强平移比例上限。"),
-    "augmentation.scale_limit": ("缩放范围", "仿射增强缩放比例上限。"),
-    "augmentation.shear_limit": ("错切范围", "仿射增强错切角度上限。"),
-    "augmentation.horizontal_flip": ("水平翻转", "是否在训练中启用随机水平翻转。"),
-    "augmentation.use_noise": ("高斯噪声开关", "是否启用高斯噪声增强。"),
-    "augmentation.noise_std_min": ("噪声下限", "高斯噪声标准差最小值。"),
-    "augmentation.noise_std_max": ("噪声上限", "高斯噪声标准差最大值。"),
-    "augmentation.noise_p": ("噪声概率", "高斯噪声增强执行概率。"),
-    "augmentation.use_blur": ("模糊增强开关", "是否启用高斯模糊增强。"),
-    "augmentation.blur_limit": ("模糊核上限", "高斯模糊 kernel 尺寸上限。"),
-    "augmentation.blur_p": ("模糊概率", "高斯模糊增强执行概率。"),
-    "training.epochs": ("训练轮数", "完整遍历训练集的轮次数。"),
-    "training.batch_size": ("训练 batch 大小", "训练集 DataLoader 的 batch size。"),
-    "training.val_batch_size": ("验证 batch 大小", "验证集 DataLoader 的 batch size。"),
-    "training.test_batch_size": ("测试 batch 大小", "测试集 DataLoader 的 batch size。"),
-    "training.optimizer": ("优化器", "训练使用的优化算法。"),
-    "training.lr": ("学习率", "优化器初始学习率。"),
-    "training.weight_decay": ("权重衰减", "L2 正则化强度。"),
-    "training.momentum": ("动量", "SGD 优化器使用的动量参数。"),
-    "training.scheduler": ("学习率调度器", "学习率衰减策略。"),
-    "training.min_lr": ("最小学习率", "调度器允许下降到的最小学习率。"),
-    "training.loss": ("损失函数", "回归训练使用的损失函数。"),
-    "training.smooth_l1_beta": ("SmoothL1 beta", "SmoothL1 损失的 beta 参数。"),
-    "training.amp": ("混合精度训练", "是否启用 AMP 以提高吞吐并降低显存。"),
-    "training.gradient_clip": ("梯度裁剪阈值", "梯度范数裁剪上限，0 或 null 表示关闭。"),
-    "training.compile": ("torch.compile", "是否对模型进行编译优化。"),
-    "training.best_metric": ("最佳模型指标", "用于保存 best checkpoint 的验证指标名。"),
-    "training.resume_checkpoint": ("续训 checkpoint", "从指定 checkpoint 恢复训练。"),
-    "training.progress_bar": ("进度条开关", "是否显示 epoch 内 batch 进度条。"),
-    "training.log_interval": ("日志间隔", "每隔多少个 batch 输出一次批次日志；0 表示仅输出首尾 batch。"),
-    "training.workers_override": ("DataLoader 线程覆盖", "手动指定 DataLoader num_workers。"),
-    "training.prefetch_factor": ("预取因子", "每个 worker 预取 batch 数。"),
-    "training.persistent_workers": ("常驻 worker", "epoch 间保持 DataLoader worker 常驻。"),
-    "training.pin_memory": ("固定内存", "是否启用 pin_memory 加速主机到 GPU 拷贝。"),
-    "debug.limit_train_samples": ("训练样本限制", "仅用于调试，限制训练样本数量。"),
-    "debug.limit_val_samples": ("验证样本限制", "仅用于调试，限制验证样本数量。"),
-    "debug.limit_test_samples": ("测试样本限制", "仅用于调试，限制测试样本数量。"),
-    "optuna.direction": ("调参优化方向", "Optuna 目标方向，minimize 或 maximize。"),
-    "optuna.n_trials": ("调参试验次数", "Optuna 运行的 trial 总数。"),
-    "optuna.timeout": ("调参超时时间", "Optuna 总超时（秒），null 表示不限制。"),
-    "optuna.epochs_per_trial": ("每轮 trial epoch 数", "每个 Optuna trial 的训练 epoch 数。"),
-}
-
-FALLBACK_NAME: dict[str, str] = {
-    "name": "名称",
-    "enabled": "开关",
-    "mode": "模式",
-    "dropout": "Dropout",
-    "hidden_dim": "隐藏维度",
-    "device": "设备",
-    "epochs": "轮数",
-    "batch_size": "批大小",
-    "lr": "学习率",
-}
+FORM_HEADER_KEYS: tuple[str, ...] = (
+    "form.header.path",
+    "form.header.name",
+    "form.header.value",
+    "form.header.description",
+)
 
 
 def _flatten_config(config: dict[str, Any], prefix: str = "") -> OrderedDict[str, Any]:
@@ -209,19 +122,19 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
-def _load_yaml_dict(path: Path) -> dict[str, Any]:
+def _load_yaml_dict(path: Path, texts: UITextManager) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
     if not isinstance(data, dict):
-        raise TypeError(f"配置文件顶层必须是字典: {path}")
+        raise TypeError(texts.get_text("error.config_root_dict", path=path))
     return data
 
 
-def _build_train_ui_config(config_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _build_train_ui_config(config_path: Path, texts: UITextManager) -> tuple[dict[str, Any], dict[str, Any]]:
     merged_config: dict[str, Any] = {}
     if DEFAULT_SCHEMA_PATH.exists():
-        merged_config = _deep_merge(merged_config, _load_yaml_dict(DEFAULT_SCHEMA_PATH))
-    selected_config = _load_yaml_dict(config_path)
+        merged_config = _deep_merge(merged_config, _load_yaml_dict(DEFAULT_SCHEMA_PATH, texts))
+    selected_config = _load_yaml_dict(config_path, texts)
     merged_config = _deep_merge(merged_config, selected_config)
     return merged_config, selected_config
 
@@ -247,7 +160,7 @@ def _to_display_value(value: Any) -> str:
         return "true" if value else "false"
     if value is None:
         return "null"
-    return str(value)
+    return normalize_visible_text(str(value))
 
 
 def _scalar_to_override(value: Any) -> str:
@@ -315,17 +228,7 @@ def _build_options(path: str, value: Any) -> list[str]:
     return deduped
 
 
-def _get_option_meta(path: str) -> tuple[str, str]:
-    meta = OPTION_META.get(path)
-    if meta is not None:
-        return meta
-    key = path.split(".")[-1]
-    cn_name = FALLBACK_NAME.get(key, key)
-    cn_desc = f"自定义参数 `{path}`。该值会在点击开始训练时作为配置覆盖项传入。"
-    return cn_name, cn_desc
-
-
-def _validate_ui_value(dotted_key: str, value: Any) -> None:
+def _validate_ui_value(texts: UITextManager, dotted_key: str, value: Any) -> None:
     allowed = STRICT_OPTIONS.get(dotted_key)
     if allowed is None:
         return
@@ -333,7 +236,7 @@ def _validate_ui_value(dotted_key: str, value: Any) -> None:
     if normalized in allowed:
         return
     allowed_text = ", ".join(sorted(allowed))
-    raise ValueError(f"{dotted_key} 仅支持以下取值: {allowed_text}")
+    raise ValueError(texts.get_text("error.value_not_allowed", key=dotted_key, allowed=allowed_text))
 
 
 def _pick_available_font(candidates: tuple[str, ...], available_fonts: dict[str, str]) -> str | None:
@@ -436,6 +339,7 @@ class _UiTextStream:
             text = data.decode("utf-8", errors="replace")
         else:
             text = str(data)
+        text = normalize_visible_text(text)
         if not text:
             return 0
         if self.original_stream is not None:
@@ -475,15 +379,22 @@ class _UiTextStream:
 class TrainUI:
     def __init__(self, root: tk.Tk, config_path: str) -> None:
         self.root = root
-        self.root.title("RHPE BoneAge Training UI")
+        self.texts = UITextManager()
+        self.root.title(self.t("window.title"))
         self.root.geometry("980x900")
         self.tk_system_encoding = _set_tcl_system_encoding(self.root)
         self.font_info = _configure_tk_font_fallback(self.root)
         _apply_ttk_font_styles(self.root, self.font_info)
 
         self.config_path_var = tk.StringVar(value=config_path)
-        self.status_var = tk.StringVar(value="就绪")
+        self.language_var = tk.StringVar(value=self.texts.get_language())
+        self.status_var = tk.StringVar(value=self.t("status.ready"))
+        self._status_key = "status.ready"
+        self._status_kwargs: dict[str, Any] = {}
+
         self.widgets: dict[str, ttk.Combobox] = {}
+        self.header_labels: list[ttk.Label] = []
+        self.field_rows: dict[str, dict[str, Any]] = {}
         self.base_flat: OrderedDict[str, Any] = OrderedDict()
         self.loaded_config: dict[str, Any] = {}
         self.running = False
@@ -504,25 +415,44 @@ class TrainUI:
         self.root.protocol("WM_DELETE_WINDOW", self._handle_close)
         self._load_config_into_form(config_path)
         if self.tk_system_encoding:
-            self.enqueue_output(f"[UI] Tcl/Tk system encoding: {self.tk_system_encoding}\n")
+            self.enqueue_output(self.t("log.tk_encoding", encoding=self.tk_system_encoding))
         if self.font_info["ui_family"]:
-            self.enqueue_output(f"[UI] 已启用中文字体: {self.font_info['ui_family']}\n")
+            self.enqueue_output(self.t("log.font_enabled", font=self.font_info["ui_family"]))
         else:
-            self.enqueue_output("[UI] 未找到显式中文字体，当前使用 Tk 默认字体。\n")
+            self.enqueue_output(self.t("log.font_default"))
+
+    def t(self, key: str, **kwargs: Any) -> str:
+        return self.texts.get_text(key, **kwargs)
 
     def _build_layout(self) -> None:
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="配置文件").pack(side=tk.LEFT)
-        config_entry = ttk.Entry(top, textvariable=self.config_path_var)
-        config_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        self.config_label = ttk.Label(top, text=self.t("top.config_file"))
+        self.config_label.pack(side=tk.LEFT)
+        self.config_entry = ttk.Entry(top, textvariable=self.config_path_var)
+        self.config_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
 
-        ttk.Button(top, text="选择文件", command=self._choose_config).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(top, text="保存配置", command=self._save_current_config).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(top, text="重新加载", command=self._reload_current_config).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(top, text="选择续训点", command=self._choose_resume_checkpoint).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(top, text="清空续训", command=self._clear_resume_checkpoint).pack(side=tk.LEFT)
+        self.select_config_button = ttk.Button(top, text=self.t("top.select_file"), command=self._choose_config)
+        self.select_config_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.save_config_button = ttk.Button(top, text=self.t("top.save_config"), command=self._save_current_config)
+        self.save_config_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.reload_config_button = ttk.Button(top, text=self.t("top.reload"), command=self._reload_current_config)
+        self.reload_config_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.select_resume_button = ttk.Button(
+            top,
+            text=self.t("top.select_resume"),
+            command=self._choose_resume_checkpoint,
+        )
+        self.select_resume_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.clear_resume_button = ttk.Button(top, text=self.t("top.clear_resume"), command=self._clear_resume_checkpoint)
+        self.clear_resume_button.pack(side=tk.LEFT)
+
+        self.language_combo = ttk.Combobox(top, state="readonly", width=10, textvariable=self.language_var)
+        self.language_combo.bind("<<ComboboxSelected>>", self._handle_language_selected)
+        self.language_combo.pack(side=tk.RIGHT)
+        self.language_label = ttk.Label(top, text=self.t("top.language"))
+        self.language_label.pack(side=tk.RIGHT, padx=(12, 6))
 
         body = ttk.Frame(self.root, padding=(10, 0, 10, 0))
         body.pack(fill=tk.BOTH, expand=True)
@@ -531,9 +461,9 @@ class TrainUI:
         pane.pack(fill=tk.BOTH, expand=True)
 
         form_container = ttk.Frame(pane)
-        log_container = ttk.LabelFrame(pane, text="训练输出", padding=(8, 8))
+        self.log_container = ttk.LabelFrame(pane, text=self.t("panel.training_output"), padding=(8, 8))
         pane.add(form_container, weight=4)
-        pane.add(log_container, weight=2)
+        pane.add(self.log_container, weight=2)
 
         self.canvas = tk.Canvas(form_container, highlightthickness=0)
         self.scrollbar = ttk.Scrollbar(form_container, orient=tk.VERTICAL, command=self.canvas.yview)
@@ -549,15 +479,17 @@ class TrainUI:
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        log_toolbar = ttk.Frame(log_container)
+        log_toolbar = ttk.Frame(self.log_container)
         log_toolbar.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(log_toolbar, text="stdout / stderr / logger").pack(side=tk.LEFT)
-        ttk.Button(log_toolbar, text="清空输出", command=self._clear_output).pack(side=tk.RIGHT)
+        self.log_streams_label = ttk.Label(log_toolbar, text=self.t("panel.output_streams"))
+        self.log_streams_label.pack(side=tk.LEFT)
+        self.clear_output_button = ttk.Button(log_toolbar, text=self.t("button.clear_output"), command=self._clear_output)
+        self.clear_output_button.pack(side=tk.RIGHT)
 
         log_font = tkfont.nametofont("TkFixedFont").copy()
         log_font.configure(size=10)
         self.output_text = scrolledtext.ScrolledText(
-            log_container,
+            self.log_container,
             wrap=tk.WORD,
             height=12,
             state=tk.DISABLED,
@@ -568,12 +500,16 @@ class TrainUI:
         bottom = ttk.Frame(self.root, padding=10)
         bottom.pack(fill=tk.X)
 
-        ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.status_label = ttk.Label(bottom, textvariable=self.status_var)
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.progress = ttk.Progressbar(bottom, mode="indeterminate", length=180)
         self.progress.pack(side=tk.RIGHT, padx=(8, 8))
-        self.run_button = ttk.Button(bottom, text="开始训练", command=self._start_training)
+        self.run_button = ttk.Button(bottom, text=self.t("button.start_training"), command=self._start_training)
         self.run_button.pack(side=tk.RIGHT, padx=(8, 0))
-        ttk.Button(bottom, text="恢复默认值", command=self._reset_to_defaults).pack(side=tk.RIGHT)
+        self.reset_defaults_button = ttk.Button(bottom, text=self.t("button.reset_defaults"), command=self._reset_to_defaults)
+        self.reset_defaults_button.pack(side=tk.RIGHT)
+
+        self._refresh_language_selector()
 
     def _install_output_redirects(self) -> None:
         sys.stdout = self._stdout_proxy
@@ -588,15 +524,80 @@ class TrainUI:
     def _handle_close(self) -> None:
         if self.running and self.training_control is not None:
             if not self.stop_requested:
-                self.enqueue_output("[UI] 检测到窗口关闭请求，已先请求停止训练，请等待任务退出。\n")
+                self.enqueue_output(self.t("log.window_close_stop_requested"))
                 self._request_stop_training()
             return
         self._output_capture_enabled = False
         self._restore_output_redirects()
         self.root.destroy()
 
+    def _refresh_language_selector(self) -> None:
+        labels = [self.texts.get_language_label(code) for code in self.texts.get_languages()]
+        self.language_combo.configure(values=labels)
+        current_index = self.texts.get_languages().index(self.texts.get_language())
+        self.language_combo.current(current_index)
+
+    def _render_status(self) -> None:
+        self.status_var.set(self.t(self._status_key, **self._status_kwargs))
+
+    def _set_status(self, key: str, **kwargs: Any) -> None:
+        self._status_key = key
+        self._status_kwargs = kwargs
+        self._render_status()
+
+    def _show_error(self, title_key: str, message_key: str, **kwargs: Any) -> None:
+        messagebox.showerror(self.t(title_key), self.t(message_key, **kwargs))
+
+    def _show_error_text(self, title_key: str, message: str) -> None:
+        messagebox.showerror(self.t(title_key), normalize_visible_text(message))
+
+    def _show_info(self, title_key: str, message_key: str, **kwargs: Any) -> None:
+        messagebox.showinfo(self.t(title_key), self.t(message_key, **kwargs))
+
+    def _refresh_texts(self) -> None:
+        self.root.title(self.t("window.title"))
+        self.config_label.configure(text=self.t("top.config_file"))
+        self.select_config_button.configure(text=self.t("top.select_file"))
+        self.save_config_button.configure(text=self.t("top.save_config"))
+        self.reload_config_button.configure(text=self.t("top.reload"))
+        self.select_resume_button.configure(text=self.t("top.select_resume"))
+        self.clear_resume_button.configure(text=self.t("top.clear_resume"))
+        self.language_label.configure(text=self.t("top.language"))
+        self.log_container.configure(text=self.t("panel.training_output"))
+        self.log_streams_label.configure(text=self.t("panel.output_streams"))
+        self.clear_output_button.configure(text=self.t("button.clear_output"))
+        self.reset_defaults_button.configure(text=self.t("button.reset_defaults"))
+        self._configure_run_button(running=self.running, stopping=self.stop_requested)
+        self._refresh_language_selector()
+        self._render_status()
+        self._refresh_form_texts()
+
+    def _refresh_form_texts(self) -> None:
+        for label, key in zip(self.header_labels, FORM_HEADER_KEYS):
+            label.configure(text=self.t(key))
+        for dotted_key, row in self.field_rows.items():
+            name, desc = self.texts.get_option_meta(dotted_key)
+            row["name_label"].configure(text=name)
+            row["desc_label"].configure(text=desc)
+
+    def _handle_language_selected(self, _event: tk.Event | None = None) -> None:
+        index = self.language_combo.current()
+        if index < 0:
+            return
+        selected_language = self.texts.get_languages()[index]
+        if selected_language == self.texts.get_language():
+            return
+        self.texts.set_language(selected_language)
+        self._refresh_texts()
+        self.enqueue_output(
+            self.t(
+                "log.language_switched",
+                language=self.texts.get_language_label(selected_language),
+            )
+        )
+
     def enqueue_output(self, text: str) -> None:
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        normalized = normalize_visible_text(text).replace("\r\n", "\n").replace("\r", "\n")
         self.log_queue.put(normalized)
         if not self._log_flush_scheduled:
             self._log_flush_scheduled = True
@@ -636,21 +637,24 @@ class TrainUI:
         if not logger.handlers:
             return
         log_method = getattr(logger, level, logger.info)
-        log_method(message, extra={"phase": "SYSTEM"})
+        log_method(normalize_visible_text(message), extra={"phase": "SYSTEM"})
 
     def _configure_run_button(self, *, running: bool, stopping: bool = False) -> None:
         if running and not stopping:
-            self.run_button.configure(text="停止训练", command=self._request_stop_training, state=tk.NORMAL)
+            self.run_button.configure(text=self.t("button.stop_training"), command=self._request_stop_training, state=tk.NORMAL)
             return
         if running and stopping:
-            self.run_button.configure(text="正在停止...", command=self._request_stop_training, state=tk.DISABLED)
+            self.run_button.configure(text=self.t("button.stopping"), command=self._request_stop_training, state=tk.DISABLED)
             return
-        self.run_button.configure(text="开始训练", command=self._start_training, state=tk.NORMAL)
+        self.run_button.configure(text=self.t("button.start_training"), command=self._start_training, state=tk.NORMAL)
 
     def _choose_config(self) -> None:
         selected = filedialog.askopenfilename(
-            title="选择配置文件",
-            filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")],
+            title=self.t("file_dialog.select_config"),
+            filetypes=[
+                (self.t("filetype.yaml"), "*.yaml *.yml"),
+                (self.t("filetype.all"), "*.*"),
+            ],
         )
         if not selected:
             return
@@ -663,7 +667,7 @@ class TrainUI:
     def _set_field_value(self, dotted_key: str, value: str) -> None:
         widget = self.widgets.get(dotted_key)
         if widget is None:
-            raise KeyError(f"表单中不存在配置项: {dotted_key}")
+            raise ValueError(self.t("error.form_field_missing", key=dotted_key))
         widget.set(value)
 
     def _choose_resume_checkpoint(self) -> None:
@@ -684,35 +688,37 @@ class TrainUI:
             initial_dir = str(Path("outputs").resolve())
 
         selected = filedialog.askopenfilename(
-            title="选择续训 checkpoint",
+            title=self.t("file_dialog.select_resume"),
             initialdir=initial_dir,
             initialfile=initial_file,
             filetypes=[
-                ("PyTorch checkpoints", "*.pt *.pth *.ckpt"),
-                ("All files", "*.*"),
+                (self.t("filetype.checkpoint"), "*.pt *.pth *.ckpt"),
+                (self.t("filetype.all"), "*.*"),
             ],
         )
         if not selected:
             return
         try:
             self._set_field_value("training.resume_checkpoint", selected)
-        except KeyError as exc:
-            messagebox.showerror("配置错误", str(exc))
+        except ValueError as exc:
+            self._show_error_text("dialog.config_error_title", str(exc))
             return
-        self.status_var.set(f"已选择续训 checkpoint: {selected}")
+        self._set_status("status.resume_selected", path=selected)
 
     def _clear_resume_checkpoint(self) -> None:
         try:
             self._set_field_value("training.resume_checkpoint", "null")
-        except KeyError as exc:
-            messagebox.showerror("配置错误", str(exc))
+        except ValueError as exc:
+            self._show_error_text("dialog.config_error_title", str(exc))
             return
-        self.status_var.set("已清空续训 checkpoint，将从头开始训练。")
+        self._set_status("status.resume_cleared")
 
     def _clear_form(self) -> None:
         for child in self.form_frame.winfo_children():
             child.destroy()
         self.widgets.clear()
+        self.header_labels.clear()
+        self.field_rows.clear()
 
     def _collect_current_config(self) -> dict[str, Any]:
         current_config = copy.deepcopy(self.loaded_config)
@@ -726,30 +732,30 @@ class TrainUI:
             else:
                 parsed_value = _parse_value(current_raw)
                 if parsed_value is None and base_value is not None:
-                    raise ValueError(f"{dotted_key} 不能设置为 null，请填写有效值或恢复默认值。")
-                _validate_ui_value(dotted_key, parsed_value)
+                    raise ValueError(self.t("error.null_not_allowed", key=dotted_key))
+                _validate_ui_value(self.texts, dotted_key, parsed_value)
             _assign_nested_value(current_config, dotted_key, parsed_value)
         return current_config
 
     def _save_current_config(self) -> None:
         config_path = self.config_path_var.get().strip()
         if not config_path:
-            messagebox.showerror("保存失败", "当前没有可保存的配置文件路径。")
+            self._show_error("dialog.save_failed_title", "dialog.no_save_path")
             return
         current_path = Path(config_path)
         default_name = current_path.name or "config.yaml"
         file_name = simpledialog.askstring(
-            "重命名配置文件",
-            "请输入保存文件名：",
+            self.t("dialog.rename_config_title"),
+            self.t("dialog.rename_config_prompt"),
             parent=self.root,
             initialvalue=default_name,
         )
         if file_name is None:
-            self.status_var.set("已取消保存配置。")
+            self._set_status("status.save_cancelled")
             return
         normalized_name = file_name.strip()
         if not normalized_name:
-            messagebox.showerror("保存失败", "文件名不能为空。")
+            self._show_error("dialog.save_failed_title", "dialog.empty_file_name")
             return
         path = current_path.parent / normalized_name
         if path.suffix.lower() not in {".yaml", ".yml"}:
@@ -760,24 +766,24 @@ class TrainUI:
             with path.open("w", encoding="utf-8") as handle:
                 yaml.safe_dump(config_to_save, handle, allow_unicode=True, sort_keys=False)
         except ValueError as exc:
-            messagebox.showerror("配置错误", str(exc))
+            self._show_error_text("dialog.config_error_title", str(exc))
             return
         except Exception as exc:
-            messagebox.showerror("保存失败", f"无法保存配置文件:\n{exc}")
+            self._show_error("dialog.save_failed_title", "dialog.save_failed_detail", error=exc)
             return
         self.config_path_var.set(str(path))
         self._load_config_into_form(str(path))
-        self.status_var.set(f"配置已保存到: {path}")
+        self._set_status("status.config_saved", path=path)
 
     def _load_config_into_form(self, config_path: str) -> None:
         path = Path(config_path)
         if not path.exists():
-            messagebox.showerror("配置文件不存在", f"找不到配置文件: {path}")
+            self._show_error("dialog.config_not_found_title", "dialog.config_not_found_detail", path=path)
             return
         try:
-            merged_config, selected_config = _build_train_ui_config(path)
+            merged_config, selected_config = _build_train_ui_config(path, self.texts)
         except Exception as exc:
-            messagebox.showerror("读取失败", f"无法读取配置文件:\n{exc}")
+            self._show_error("dialog.read_failed_title", "dialog.read_failed_detail", error=exc)
             return
 
         self._clear_form()
@@ -795,40 +801,53 @@ class TrainUI:
                 added_from_default += 1
             self.base_flat[dotted_key] = value
 
-        headers = ["配置路径", "中文名称", "参数取值", "参数释义"]
-        for index, header in enumerate(headers):
-            ttk.Label(self.form_frame, text=header).grid(
+        for index, header_key in enumerate(FORM_HEADER_KEYS):
+            header_label = ttk.Label(self.form_frame, text=self.t(header_key))
+            header_label.grid(
                 row=0,
                 column=index,
                 sticky="w",
                 padx=(0, 8),
                 pady=(2, 8),
             )
+            self.header_labels.append(header_label)
 
         row = 1
         for dotted_key, value in self.base_flat.items():
-            cn_name, cn_desc = _get_option_meta(dotted_key)
-            ttk.Label(self.form_frame, text=dotted_key).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=4)
-            ttk.Label(self.form_frame, text=cn_name).grid(row=row, column=1, sticky="nw", padx=(0, 8), pady=4)
+            display_name, description = self.texts.get_option_meta(dotted_key)
+            path_label = ttk.Label(self.form_frame, text=dotted_key)
+            path_label.grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=4)
+            name_label = ttk.Label(self.form_frame, text=display_name)
+            name_label.grid(row=row, column=1, sticky="nw", padx=(0, 8), pady=4)
             options = _build_options(dotted_key, value)
             combo = ttk.Combobox(self.form_frame, values=options, state="normal")
             combo.set(_to_display_value(value))
             combo.grid(row=row, column=2, sticky="ew", padx=(0, 8), pady=4)
             self.widgets[dotted_key] = combo
-            ttk.Label(
+            desc_label = ttk.Label(
                 self.form_frame,
-                text=cn_desc,
+                text=description,
                 justify=tk.LEFT,
                 wraplength=520,
-            ).grid(row=row, column=3, sticky="nw", padx=(0, 8), pady=4)
+            )
+            desc_label.grid(row=row, column=3, sticky="nw", padx=(0, 8), pady=4)
+            self.field_rows[dotted_key] = {
+                "path_label": path_label,
+                "name_label": name_label,
+                "desc_label": desc_label,
+                "combo": combo,
+            }
             row += 1
 
         self.form_frame.columnconfigure(0, weight=2)
         self.form_frame.columnconfigure(1, weight=2)
         self.form_frame.columnconfigure(2, weight=1)
         self.form_frame.columnconfigure(3, weight=4)
-        self.status_var.set(
-            f"已加载 {len(self.base_flat)} 个训练参数，补全 {added_from_default} 个默认参数，隐藏 {hidden_count} 个当前训练模式不生效的参数。"
+        self._set_status(
+            "status.config_loaded_summary",
+            visible_count=len(self.base_flat),
+            default_count=added_from_default,
+            hidden_count=hidden_count,
         )
 
     def _reset_to_defaults(self) -> None:
@@ -836,7 +855,7 @@ class TrainUI:
             widget = self.widgets.get(dotted_key)
             if widget is not None:
                 widget.set(_to_display_value(value))
-        self.status_var.set("参数已恢复为配置默认值。")
+        self._set_status("status.defaults_restored")
 
     def _collect_overrides(self) -> list[str]:
         overrides: list[str] = []
@@ -846,20 +865,18 @@ class TrainUI:
                 continue
             current_raw = widget.get()
             if current_raw.strip() == "":
-                # An empty editable combobox should behave like "keep current value",
-                # otherwise required numeric fields can accidentally become None.
                 continue
             parsed_value = _parse_value(current_raw)
             if parsed_value is None and base_value is not None:
-                raise ValueError(f"{dotted_key} 不能设置为 null，请填写有效值或恢复默认值。")
-            _validate_ui_value(dotted_key, parsed_value)
+                raise ValueError(self.t("error.null_not_allowed", key=dotted_key))
+            _validate_ui_value(self.texts, dotted_key, parsed_value)
             if parsed_value != base_value:
                 overrides.append(f"{dotted_key}={_scalar_to_override(parsed_value)}")
         return overrides
 
-    def _set_running(self, running: bool, message: str) -> None:
+    def _set_running(self, running: bool, status_key: str, **status_kwargs: Any) -> None:
         self.running = running
-        self.status_var.set(message)
+        self._set_status(status_key, **status_kwargs)
         if running:
             self._configure_run_button(running=True, stopping=self.stop_requested)
             self.progress.start(10)
@@ -875,20 +892,20 @@ class TrainUI:
 
     def _handle_training_stopped(self, stop_text: str) -> None:
         self._reset_training_runtime()
-        self._set_running(False, "训练已停止。")
-        self.enqueue_output(f"\n[UI] 训练已停止: {stop_text}\n")
+        self._set_running(False, "status.training_stopped")
+        self.enqueue_output(self.t("log.training_stopped", reason=stop_text))
 
     def _handle_training_success(self, run_dir: str) -> None:
         self._reset_training_runtime()
-        self._set_running(False, f"训练完成。输出目录: {run_dir}")
-        self.enqueue_output(f"\n[UI] 训练完成，输出目录: {run_dir}\n")
-        messagebox.showinfo("训练完成", f"训练已完成。\n输出目录:\n{run_dir}")
+        self._set_running(False, "status.training_finished", run_dir=run_dir)
+        self.enqueue_output(self.t("log.training_finished", run_dir=run_dir))
+        self._show_info("dialog.training_complete_title", "dialog.training_complete_detail", run_dir=run_dir)
 
     def _handle_training_error(self, error_text: str) -> None:
         self._reset_training_runtime()
-        self._set_running(False, "训练失败。")
-        self.enqueue_output(f"\n[UI] 训练失败: {error_text}\n")
-        messagebox.showerror("训练失败", error_text)
+        self._set_running(False, "status.training_failed")
+        self.enqueue_output(self.t("log.training_failed", error=error_text))
+        self._show_error_text("dialog.training_failed_title", error_text)
 
     def _request_stop_training(self) -> None:
         if not self.running or self.training_control is None or self.stop_requested:
@@ -896,36 +913,41 @@ class TrainUI:
         self.stop_requested = True
         self.training_control.request_stop()
         phase, scope, _ = self.training_control.snapshot()
-        stop_message = f"用户请求停止训练 | phase={phase} | scope={scope or 'n/a'}"
-        self.status_var.set("正在请求停止训练...")
+        self._set_status("status.stop_requested")
         self._configure_run_button(running=True, stopping=True)
-        self.enqueue_output(f"[UI] {stop_message}\n")
-        self._log_control_message(stop_message, level="warning")
+        stop_scope = scope or "n/a"
+        message = self.t("log.user_stop_requested", phase=phase, scope=stop_scope)
+        self.enqueue_output(message)
+        self._log_control_message(message, level="warning")
 
     def _start_training(self) -> None:
         if self.running or (self.training_thread is not None and self.training_thread.is_alive()):
             return
         config_path = self.config_path_var.get().strip()
         if not Path(config_path).exists():
-            messagebox.showerror("配置错误", f"配置文件不存在: {config_path}")
+            self._show_error("dialog.config_error_title", "dialog.config_path_missing_detail", path=config_path)
             return
         try:
             overrides = self._collect_overrides()
         except ValueError as exc:
-            messagebox.showerror("配置错误", str(exc))
+            self._show_error_text("dialog.config_error_title", str(exc))
             return
         from rhpe_boneage.training.control import TrainingCancelledError, TrainingControl
 
         self.training_control = TrainingControl()
         self.stop_requested = False
-        self._set_running(True, "训练启动中...")
+        self._set_running(True, "status.training_starting")
         self.enqueue_output(
-            f"\n{'=' * 96}\n"
-            f"[UI] 启动训练 | config={config_path} | overrides={len(overrides)}\n"
+            self.t(
+                "log.training_start_banner",
+                separator="=" * 96,
+                config_path=config_path,
+                override_count=len(overrides),
+            )
         )
         if overrides:
             for item in overrides:
-                self.enqueue_output(f"[UI] override | {item}\n")
+                self.enqueue_output(self.t("log.override", item=item))
 
         def _worker() -> None:
             try:
@@ -950,11 +972,12 @@ class TrainUI:
 
 def main() -> None:
     bootstrap()
+    cli_texts = UITextManager()
 
-    parser = argparse.ArgumentParser(description="训练前 UI 参数配置面板")
-    parser.add_argument("--config", default="configs/default.yaml", help="配置文件路径")
-    parser.add_argument("--set", dest="overrides", action="append", default=[], help="覆盖配置，格式 key=value")
-    parser.add_argument("--auto-run", action="store_true", help="不启动图形界面，直接按当前参数启动训练")
+    parser = argparse.ArgumentParser(description=cli_texts.get_text("cli.description"))
+    parser.add_argument("--config", default="configs/default.yaml", help=cli_texts.get_text("cli.help.config"))
+    parser.add_argument("--set", dest="overrides", action="append", default=[], help=cli_texts.get_text("cli.help.set"))
+    parser.add_argument("--auto-run", action="store_true", help=cli_texts.get_text("cli.help.auto_run"))
     args = parser.parse_args()
 
     if args.auto_run:
