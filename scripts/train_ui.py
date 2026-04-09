@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import logging
+import os
 import platform
 import queue
 import re
@@ -53,6 +54,8 @@ STRICT_OPTIONS: dict[str, set[str]] = {
 
 DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
 _SCIENTIFIC_NOTATION_PATTERN = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))[eE][+-]?\d+$")
+_WINDOWS_DRIVE_PATTERN = re.compile(r"^(?P<drive>[A-Za-z]):[\\/](?P<rest>.*)$")
+_WSL_MOUNT_PATTERN = re.compile(r"^/mnt/(?P<drive>[A-Za-z])/(?P<rest>.*)$")
 FONT_CANDIDATES_UI: tuple[str, ...] = (
     "Noto Sans CJK SC",
     "Noto Serif CJK SC",
@@ -352,6 +355,36 @@ def _parse_value(raw: str) -> Any:
     return value
 
 
+def _normalize_resume_checkpoint_path(raw_value: Any) -> str | None:
+    if raw_value is None:
+        return None
+
+    text = normalize_visible_text(str(raw_value)).strip()
+    if not text or text.lower() == "null":
+        return None
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    if not text:
+        return None
+
+    text = os.path.expandvars(os.path.expanduser(text))
+    system_name = platform.system().lower()
+    if system_name.startswith("win"):
+        wsl_match = _WSL_MOUNT_PATTERN.fullmatch(text.replace("\\", "/"))
+        if wsl_match is not None:
+            drive = wsl_match.group("drive").upper()
+            rest = re.sub(r"/+", "/", wsl_match.group("rest")).lstrip("/").replace("/", "\\")
+            return f"{drive}:\\{rest}" if rest else f"{drive}:\\"
+        return text
+
+    windows_match = _WINDOWS_DRIVE_PATTERN.fullmatch(text)
+    if windows_match is None:
+        return text
+    drive = windows_match.group("drive").lower()
+    rest = re.sub(r"[\\/]+", "/", windows_match.group("rest")).lstrip("/")
+    return f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
+
+
 def _format_elapsed_clock(seconds: float | None) -> str:
     if seconds is None:
         return "--:--:--"
@@ -510,6 +543,8 @@ class TrainUI:
         _apply_ttk_font_styles(self.root, self.font_info)
 
         self.config_path_var = tk.StringVar(value=config_path)
+        self.resume_checkpoint_var = tk.StringVar(value="")
+        self.resume_mode_var = tk.StringVar(value="")
         self.language_var = tk.StringVar(value=self.texts.get_language())
         self.status_var = tk.StringVar(value=self.t("status.ready"))
         self.elapsed_var = tk.StringVar(value=self.t("timer.idle"))
@@ -524,6 +559,7 @@ class TrainUI:
         self.advanced_toggle_button: ttk.Button | None = None
         self.advanced_body: ttk.Frame | None = None
         self.base_values: dict[str, Any] = {}
+        self.base_resume_checkpoint: str | None = None
         self.loaded_config: dict[str, Any] = {}
         self.running = False
         self.stop_requested = False
@@ -542,6 +578,8 @@ class TrainUI:
         self._stderr_proxy = _UiTextStream(self, self._original_stderr)
 
         self._build_layout()
+        self.resume_checkpoint_var.trace_add("write", self._handle_resume_checkpoint_changed)
+        self._update_resume_mode_text()
         self._install_output_redirects()
         self.root.protocol("WM_DELETE_WINDOW", self._handle_close)
         self._load_config_into_form(config_path)
@@ -576,6 +614,42 @@ class TrainUI:
         self.language_combo.pack(side=tk.RIGHT)
         self.language_label = ttk.Label(top, text=self.t("top.language"))
         self.language_label.pack(side=tk.RIGHT, padx=(12, 6))
+
+        self.resume_section = ttk.LabelFrame(self.root, text=self.t("resume.section_title"), padding=(10, 8))
+        self.resume_section.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self.resume_description_label = ttk.Label(
+            self.resume_section,
+            text=self.t("resume.description"),
+            justify=tk.LEFT,
+            wraplength=980,
+        )
+        self.resume_description_label.pack(fill=tk.X, pady=(0, 8))
+
+        resume_row = ttk.Frame(self.resume_section)
+        resume_row.pack(fill=tk.X)
+        self.resume_path_label = ttk.Label(resume_row, text=self._resume_field_label())
+        self.resume_path_label.pack(side=tk.LEFT)
+        self.resume_entry = ttk.Entry(resume_row, textvariable=self.resume_checkpoint_var)
+        self.resume_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        self.select_resume_button = ttk.Button(
+            resume_row,
+            text=self.t("top.select_resume"),
+            command=self._choose_resume_checkpoint,
+        )
+        self.select_resume_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.clear_resume_button = ttk.Button(
+            resume_row,
+            text=self.t("top.clear_resume"),
+            command=self._clear_resume_checkpoint,
+        )
+        self.clear_resume_button.pack(side=tk.LEFT)
+        self.resume_mode_label = ttk.Label(
+            self.resume_section,
+            textvariable=self.resume_mode_var,
+            justify=tk.LEFT,
+            wraplength=980,
+        )
+        self.resume_mode_label.pack(fill=tk.X, pady=(8, 0))
 
         body = ttk.Frame(self.root, padding=(10, 0, 10, 0))
         body.pack(fill=tk.BOTH, expand=True)
@@ -689,6 +763,34 @@ class TrainUI:
     def _show_info(self, title_key: str, message_key: str, **kwargs: Any) -> None:
         messagebox.showinfo(self.t(title_key), self.t(message_key, **kwargs))
 
+    def _resume_field_label(self) -> str:
+        name, _description = self.texts.get_option_meta("training.resume_checkpoint")
+        return name
+
+    def _get_resume_checkpoint_value(self) -> str | None:
+        return _normalize_resume_checkpoint_path(self.resume_checkpoint_var.get())
+
+    def _update_resume_mode_text(self) -> None:
+        resume_checkpoint = self._get_resume_checkpoint_value()
+        if resume_checkpoint:
+            self.resume_mode_var.set(self.t("resume.mode_resume", path=resume_checkpoint))
+            return
+        self.resume_mode_var.set(self.t("resume.mode_fresh"))
+
+    def _set_resume_checkpoint(self, value: Any, *, status_key: str | None = None) -> None:
+        normalized = _normalize_resume_checkpoint_path(value)
+        display_value = normalized or ""
+        if self.resume_checkpoint_var.get() != display_value:
+            self.resume_checkpoint_var.set(display_value)
+        else:
+            self._update_resume_mode_text()
+        if status_key is not None:
+            status_kwargs = {"path": normalized} if normalized else {}
+            self._set_status(status_key, **status_kwargs)
+
+    def _handle_resume_checkpoint_changed(self, *_args: Any) -> None:
+        self._update_resume_mode_text()
+
     def _refresh_texts(self) -> None:
         self.root.title(self.t("window.title"))
         self.config_label.configure(text=self.t("top.config_file"))
@@ -696,12 +798,18 @@ class TrainUI:
         self.save_config_button.configure(text=self.t("top.save_config"))
         self.reload_config_button.configure(text=self.t("top.reload"))
         self.language_label.configure(text=self.t("top.language"))
+        self.resume_section.configure(text=self.t("resume.section_title"))
+        self.resume_description_label.configure(text=self.t("resume.description"))
+        self.resume_path_label.configure(text=self._resume_field_label())
+        self.select_resume_button.configure(text=self.t("top.select_resume"))
+        self.clear_resume_button.configure(text=self.t("top.clear_resume"))
         self.log_container.configure(text=self.t("panel.training_output"))
         self.log_streams_label.configure(text=self.t("panel.output_streams"))
         self.clear_output_button.configure(text=self.t("button.clear_output"))
         self.reset_defaults_button.configure(text=self.t("button.reset_defaults"))
         self._configure_run_button(running=self.running, stopping=self.stop_requested)
         self._refresh_language_selector()
+        self._update_resume_mode_text()
         self._render_status()
         self._render_elapsed()
         self._refresh_form_texts()
@@ -837,6 +945,21 @@ class TrainUI:
             return
         self.config_path_var.set(selected)
         self._load_config_into_form(selected)
+
+    def _choose_resume_checkpoint(self) -> None:
+        selected = filedialog.askopenfilename(
+            title=self.t("file_dialog.select_resume"),
+            filetypes=[
+                (self.t("filetype.checkpoint"), "*.pt *.pth *.ckpt"),
+                (self.t("filetype.all"), "*.*"),
+            ],
+        )
+        if not selected:
+            return
+        self._set_resume_checkpoint(selected, status_key="status.resume_selected")
+
+    def _clear_resume_checkpoint(self) -> None:
+        self._set_resume_checkpoint(None, status_key="status.resume_cleared")
 
     def _reload_current_config(self) -> None:
         self._load_config_into_form(self.config_path_var.get().strip())
@@ -1129,6 +1252,7 @@ class TrainUI:
         current_config = copy.deepcopy(self.loaded_config)
         for dotted_key, value in current_values.items():
             _assign_nested_value(current_config, dotted_key, value)
+        _assign_nested_value(current_config, "training.resume_checkpoint", self._get_resume_checkpoint_value())
         return current_config
 
     def _save_current_config(self) -> None:
@@ -1187,6 +1311,10 @@ class TrainUI:
         hidden_count = sum(1 for dotted_key in merged_flat if dotted_key not in FIELD_SPEC_MAP)
         added_from_default = 0
         self.base_values = {}
+        self.base_resume_checkpoint = _normalize_resume_checkpoint_path(
+            _lookup_nested_value(merged_config, "training.resume_checkpoint", None)
+        )
+        self._set_resume_checkpoint(self.base_resume_checkpoint)
 
         section_containers = self._build_section_frames()
         for spec in VISIBLE_FIELD_SPECS:
@@ -1215,6 +1343,7 @@ class TrainUI:
                 binding.variable.set(bool(base_value))
             else:
                 binding.variable.set(str(self._display_field_value(spec, base_value)))
+        self._set_resume_checkpoint(self.base_resume_checkpoint)
         self._update_field_states()
         self._set_status("status.defaults_restored")
 
@@ -1227,6 +1356,9 @@ class TrainUI:
             current_value = current_values.get(spec.path)
             if current_value != base_value:
                 overrides.append(f"{spec.path}={_scalar_to_override(current_value)}")
+        current_resume_checkpoint = self._get_resume_checkpoint_value()
+        if current_resume_checkpoint != self.base_resume_checkpoint:
+            overrides.append(f"training.resume_checkpoint={_scalar_to_override(current_resume_checkpoint)}")
         return overrides
 
     def _set_running(self, running: bool, status_key: str, **status_kwargs: Any) -> None:
@@ -1295,6 +1427,23 @@ class TrainUI:
         except ValueError as exc:
             self._show_error_text("dialog.config_error_title", str(exc))
             return
+        resume_checkpoint = self._get_resume_checkpoint_value()
+        if resume_checkpoint:
+            resume_path = Path(resume_checkpoint)
+            if not resume_path.exists():
+                self._show_error(
+                    "dialog.config_error_title",
+                    "dialog.resume_checkpoint_not_found_detail",
+                    path=resume_checkpoint,
+                )
+                return
+            if not resume_path.is_file():
+                self._show_error(
+                    "dialog.config_error_title",
+                    "dialog.resume_checkpoint_not_file_detail",
+                    path=resume_checkpoint,
+                )
+                return
         from rhpe_boneage.training.control import TrainingCancelledError, TrainingControl
 
         self.training_control = TrainingControl()
@@ -1311,6 +1460,10 @@ class TrainUI:
                 override_count=len(overrides),
             )
         )
+        if resume_checkpoint:
+            self.enqueue_output(self.t("log.training_mode_resume", path=resume_checkpoint))
+        else:
+            self.enqueue_output(self.t("log.training_mode_fresh"))
         if overrides:
             for item in overrides:
                 self.enqueue_output(self.t("log.override", item=item))

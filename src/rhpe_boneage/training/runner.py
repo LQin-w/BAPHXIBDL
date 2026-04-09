@@ -1466,6 +1466,10 @@ def train_main(
             _format_duration_clock(time.perf_counter() - training_started_at),
             extra=_phase_extra("SYSTEM"),
         )
+        if resume_checkpoint:
+            logger.info("训练模式 | mode=resume | checkpoint=%s", resume_checkpoint, extra=_phase_extra("SYSTEM"))
+        else:
+            logger.info("训练模式 | mode=fresh | checkpoint=n/a", extra=_phase_extra("SYSTEM"))
         _log_running_mode(logger, config)
         raise_if_stop_requested(control, logger, phase="system", scope="initializing", checkpoint="before_runtime_setup")
 
