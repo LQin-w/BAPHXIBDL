@@ -1,0 +1,15 @@
+experiment:
+  name: ablation_innovation_00_full
+  mode: enhanced
+  seed: 2026
+
+runtime:
+  allow_cpu_fallback: false
+
+training:
+  epochs: 150
+  compile: true
+  compile_mode: reduce-overhead
+  early_stopping_patience: 16
+  early_stopping_min_delta: 0.01
+
