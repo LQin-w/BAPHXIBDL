@@ -1,9 +1,0 @@
-{
-  "image_dir": "/home/lqw/DLBBAP/dataset/RHPE_train",
-  "mean": 0.0,
-  "std": 1.0,
-  "mean_255": 0.0,
-  "std_255": 255.0,
-  "source": "manual",
-  "stats_path": "dataset/train_mean_std.json"
-}

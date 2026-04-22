@@ -1,159 +1,218 @@
 # RHPE 手骨骨龄预测工程框架
 
-这是一个融合 `SIMBA` 与 `BoNet` 思想的多模态骨龄预测工程框架，重点是工程化训练、可解释配置和可复现实验，不是两篇论文原始代码的直接复现版本。
+这是一个围绕 RHPE 数据集构建的工程化骨龄回归项目。当前主工程位于 `src/rhpe_boneage/`，通过 `scripts/*.py` 提供训练、验证、测试、推理、数据检查、Optuna 搜索和 Tk UI。仓库同时保留了 `SIMBA/` 与 `Bonet-master/` 两份参考实现，但当前主流程不会直接 import 或执行这些旧代码。
 
-## 1. 项目定义
+## 当前仓库的真实定位
 
-- 任务：预测 RHPE 数据集中的 `Boneage`
-- 默认训练目标：`relative age = Boneage - Chronological`
-- 最终输出：`final_boneage = predicted_relative_age + Chronological`
+- 任务：基于 RHPE 手部 X 光图像预测骨龄
+- 默认训练目标：`relative bone age = Boneage - Chronological`
+- 默认运行声明：`experiment.mode=enhanced`
+- 默认模型：`ensemble`，即 `resnet18 + efficientnet_b0`
+- 默认分支：`global_local`
 - 默认 metadata 模式：`mlp`
-- 可选 metadata 模式：`mlp`、`simba_multiplier`、`simba_hybrid`
-- 默认运行模式声明：`experiment.mode=enhanced`
+- 默认图像归一化：`auto_train_stats`
+- 当前 test 集只有 `ID / Male / Chronological`，没有 `Boneage` 真值
 
-默认行为的设计原则是“先保证工程稳定，再提供论文相关变体用于对照实验”。因此默认配置不是论文忠实复现，而是当前工程增强版。
+这意味着：
 
-## 2. 两篇论文与参考文件夹
+- `experiment.mode` 主要用于实验声明和一致性告警，不会偷偷切换模型。
+- 实际行为由 `model.*`、`data.*`、`training.*` 配置决定。
+- 当前项目是“受 SIMBA 和 BoNet 启发的工程实现”，不是两篇论文原始代码的逐行复现。
 
-- `SIMBA/` 对应论文：`SIMBA: Specific Identity Markers for Bone Age Assessment`
-- `Bonet-master/` 对应论文：`Hand Pose Estimation for Pediatric Bone Age Assessment`
+## 目录结构
 
-这两个目录保留为参考代码与方法来源说明，不会被当前主训练入口直接 import 或执行。
+```text
+configs/                   当前主工程配置
+scripts/                   训练、评估、推理、UI、数据检查入口
+src/rhpe_boneage/          主工程代码
+dataset/                   RHPE 数据与标注
+outputs/                   训练/评估产物
+SIMBA/                     官方/参考 SIMBA 代码快照
+Bonet-master/              官方/参考 BoNet 代码快照
+requirements.txt           Python 依赖
+```
 
-## 3. Method Relationship
+主工程内部结构：
 
-### SIMBA
+```text
+src/rhpe_boneage/
+  config.py                YAML + CLI override 合并
+  data/                    数据发现、严格索引、数据集与增强
+  models/                  backbone、CBAM、本地分支、多模态融合
+  training/                训练循环、loss、指标、checkpoint、评估
+  utils/                   日志、设备探测、JSON/绘图工具
+```
 
-当前工程真实使用了以下思想：
+## 数据集布局
 
-- metadata 输入：`Male + Chronological`
-- relative target
-- 可选 `SIMBA` 风格 multiplier / hybrid metadata 分支
+当前仓库已经包含 RHPE 数据目录，主流程默认从 `dataset/` 自动发现：
 
-当前工程没有直接使用以下内容：
+```text
+dataset/
+  RHPE_train/
+  RHPE_val/
+  RHPE_test/
+  RHPE_Annotations/
+    RHPE_Boneage_train.csv
+    RHPE_Boneage_val.csv
+    RHPE_Gender_Chronological_test.csv
+    RHPE_anatomical_ROIs_train.json
+    RHPE_anatomical_ROIs_val.json
+    RHPE_anatomical_ROIs_test.json
+    Readme.txt
+```
 
-- 原论文完整网络结构
-- 原参考工程的原始训练脚本与代码路径
+当前本地数据检查结果：
 
-因此更准确的表述是：
+- `train`: 5491 张图像，5491 条严格匹配记录
+- `val`: 713 张图像，713 条严格匹配记录
+- `test`: 79 张图像，79 条严格匹配记录
+- 当前 `scripts/inspect_dataset.py --dataset-root dataset` 结果为 0 缺图、0 缺 CSV、0 缺 ROI、0 重复 ID
 
-> 当前项目受 `SIMBA` 启发并进行了工程实现，而不是 `SIMBA` 原始代码复现。
+字段约定：
 
-### BoNet
+- train / val CSV：`ID, Male, Boneage, Chronological`
+- test CSV：`ID, Male, Chronological`
+- ROI JSON：COCO 风格，包含 `bbox`、`keypoints`
 
-当前工程真实使用了以下思想：
+`dataset/RHPE_Annotations/Readme.txt` 还记录了数据集发布后的官方清理说明；当前仓库中的 split 计数已经与这份说明一致。
 
-- ROI
-- keypoints
-- heatmap
-- local patches
-- 基于 ROI 的全局裁剪
+## 环境安装
 
-当前工程没有直接使用以下内容：
+代码使用了 Python 3.10+ 的语法和 `torch>=2.1` 的接口，建议环境至少满足：
 
-- 原始 two-channel Inception backbone
-- 原始训练流程与工程组织
+- Python 3.10+
+- PyTorch 2.1+
+- torchvision 0.16+
 
-因此更准确的表述是：
+最小安装方式：
 
-> 当前项目受 `BoNet` 启发并进行了工程实现，而不是 `BoNet` 原始代码复现。
+```bash
+python -m pip install -r requirements.txt
+```
 
-## 4. 当前默认训练行为
+依赖见 `requirements.txt`：
 
-当前默认配置定义在 [configs/default.yaml](/home/lqw/DLBBAP/configs/default.yaml)。
+- `torch`, `torchvision`, `torchaudio`
+- `numpy`, `pandas`, `scikit-learn`
+- `Pillow`, `opencv-python`, `albumentations`
+- `matplotlib`, `optuna`, `tqdm`, `PyYAML`
 
-默认主流程是：
+## 快速开始
 
-- `experiment.mode=enhanced`
-- `model.ensemble_mode=ensemble`
-- `model.branch_mode=global_local`
-- `model.target_mode=relative`
-- `model.relative_target_direction=boneage_minus_chronological`
-- `model.metadata.mode=mlp`
+先检查数据：
 
-默认训练目标为：
+```bash
+python scripts/inspect_dataset.py --dataset-root dataset
+python scripts/inspect_dataset.py --dataset-root dataset --verify-images
+```
+
+默认训练：
+
+```bash
+python scripts/train.py --config configs/default.yaml
+```
+
+启动图形界面：
+
+```bash
+python scripts/train_ui.py
+```
+
+用 UI 的当前参数直接启动训练而不打开窗口：
+
+```bash
+python scripts/train_ui.py --auto-run --config configs/default.yaml
+```
+
+续训：
+
+```bash
+python scripts/train.py \
+  --config configs/default.yaml \
+  --set training.resume_checkpoint=outputs/xxx/model/last_checkpoint.pt
+```
+
+验证 / 测试：
+
+```bash
+python scripts/validate.py --checkpoint outputs/xxx/model/best_model.pt
+python scripts/test.py --checkpoint outputs/xxx/model/best_model.pt
+```
+
+推理：
+
+```bash
+python scripts/infer.py --checkpoint outputs/xxx/model/best_model.pt
+```
+
+对任意 RHPE 风格目录推理：
+
+```bash
+python scripts/infer.py \
+  --checkpoint outputs/xxx/model/best_model.pt \
+  --image-dir path/to/images \
+  --csv-path path/to/annotations.csv \
+  --roi-json-path path/to/rois.json
+```
+
+Optuna 搜索：
+
+```bash
+python scripts/tune.py --config configs/default.yaml
+```
+
+## 配置系统
+
+配置加载顺序固定为：
+
+```text
+configs/default.yaml
+-> 你传入的 --config
+-> 命令行 --set key=value 覆盖
+```
+
+这意味着：
+
+- `configs/default.yaml` 是完整配置。
+- `configs/quality.yaml` 与 `configs/speed.yaml` 只是 overlay，不是完整独立配置。
+- `configs/simba_like.yaml` 与 `configs/Bonet-master_like.yaml` 是更接近论文思路的整套预设。
+
+当前配置文件含义：
+
+- `configs/default.yaml`：当前推荐默认工程配置
+- `configs/simba_like.yaml`：SIMBA 风格基线，`relative` 目标 + `simba_multiplier`
+- `configs/Bonet-master_like.yaml`：BoNet 风格基线，`direct` 目标 + `global_only` + gender metadata
+- `configs/quality.yaml`：在默认配置上增强正则和训练强度
+- `configs/speed.yaml`：在默认配置上降低分辨率并偏向更快训练
+
+常见运行方式：
+
+```bash
+python scripts/train.py --config configs/simba_like.yaml
+python scripts/train.py --config configs/Bonet-master_like.yaml
+python scripts/train.py --config configs/quality.yaml
+python scripts/train.py --config configs/speed.yaml
+```
+
+默认目标的计算方式：
 
 ```text
 relative_age = Boneage - Chronological
 predicted_relative_age = model(...)
-final_boneage = predicted_relative_age + Chronological
+final_boneage = Chronological + predicted_relative_age
 ```
 
-训练与验证日志会同时输出：
+如果你改成：
 
-- `relative_mae / relative_mad`
-- `final_mae / final_mad`
+- `model.target_mode=direct`：直接回归骨龄
+- `model.relative_target_direction=chronological_minus_boneage`：相对年龄方向反转
 
-其中：
+## 当前主模型结构
 
-- `relative_*` 用来描述模型对相对骨龄偏差项的学习效果
-- `final_*` 才是最终骨龄还原后的真实评估指标
+当前默认主流程接入的输入包括：
 
-兼容性说明：
-
-- 历史字段 `mae / mad` 仍然保留，但它们现在等价于 `final_mae / final_mad`
-
-## 5. 三种模式说明
-
-### `experiment.mode=enhanced`
-
-默认工程增强模式。
-
-- 目标：稳定训练、清晰对照、适合作为论文主方法实现
-- 默认 metadata：`mlp`
-- `SIMBA` 状态：partial
-- `BoNet` 状态：partial
-
-### `experiment.mode=simba`
-
-SIMBA 导向声明模式。
-
-- 用于明确当前实验希望更贴近 `SIMBA` 思想
-- 推荐同时使用 `model.target_mode=relative`
-- 推荐同时使用 `model.metadata.mode=simba_multiplier` 或 `simba_hybrid`
-- 框架仍然是当前工程实现，不会切换成原论文代码
-
-### `experiment.mode=bonet_like`
-
-BoNet 导向声明模式。
-
-- 用于明确当前实验希望更强调 ROI / keypoints / local branch
-- 推荐保持 `model.branch_mode=global_local`
-- 推荐启用 heatmap 与 local branch
-- 框架仍然是当前工程实现，不会切换成原论文代码
-
-启动训练时会打印：
-
-```text
-Running mode: enhanced (default)
-- SIMBA: partial
-- BoNet: partial
-```
-
-如果声明模式与实际配置不一致，例如 `mode=simba` 但 metadata 仍是 `mlp`，日志会主动告警。
-
-## 6. 输入与模型结构
-
-当前主模型是一个多模态回归框架：
-
-- 全局灰度图分支
-- 全局 ROI heatmap 引导
-- 局部 patch / local heatmap / ROI geometry 分支
-- metadata 分支
-- 最终融合回归头
-
-默认 ensemble 下包含两个子模型：
-
-- `resnet18`
-- `efficientnet_b0`
-
-两者分别输出预测后做均值融合。
-
-### 输入模态
-
-当前主流程真实接入的输入包括：
-
-- 灰度图像
+- 灰度全局图像
 - 全局 ROI heatmap
 - 局部 patch
 - 局部 heatmap
@@ -161,61 +220,33 @@ Running mode: enhanced (default)
 - `Male`
 - `Chronological`
 
-说明：
+模型由以下部分组成：
 
-- 数据层读取的是单通道灰度图
-- torchvision backbone 前向时会把单通道复制为 3 通道，以兼容标准主干
+1. 全局分支：`torchvision` backbone 提取全局特征，支持 `resnet18/34/50` 与 `efficientnet_b0/b1/b2`
+2. heatmap guidance：把 ROI heatmap 融入全局特征图
+3. CBAM：可分别作用于全局/局部分支
+4. 局部分支：关键点局部 patch 编码 + 注意力池化 + ROI 几何编码
+5. metadata 分支：支持 `mlp`、`simba_multiplier`、`simba_hybrid`
+6. 融合头：视觉特征与 metadata 联合回归
+7. 集成模式：可单 backbone，也可 `resnet + efficientnet` 取均值
 
-## 7. 数据读取与一致性检查
+实现细节：
 
-数据默认从 `dataset/` 自动发现：
+- 数据层读取单通道灰度图
+- backbone 前向时会把 1 通道复制成 3 通道以兼容标准 `torchvision` 主干
+- `global_crop_mode=bbox` 时，会基于 ROI bbox 加 margin 做全局裁剪
+- 局部分支在没有有效关键点时，会回退到 bbox 中心 patch
 
-- `RHPE_train`
-- `RHPE_val`
-- `RHPE_test`
-- `RHPE_Annotations`
-
-工程会建立严格映射：
-
-```text
-ID -> image_path -> csv_row -> roi_annotation
-```
-
-当前检查项包括：
-
-- 缺失图像
-- 缺失 CSV
-- 缺失 ROI
-- 重复 CSV ID
-- 重复图像 ID
-- 重复 ROI ID
-- 图像不可读
-
-其中重复 ROI 现在会做真实统计；一旦发现重复标注，将直接报错，避免训练落在不可信数据上。
-
-单独检查数据可运行：
-
-```bash
-python scripts/inspect_dataset.py --dataset-root dataset
-python scripts/inspect_dataset.py --dataset-root dataset --verify-images
-```
-
-## 8. 图像归一化
-
-默认不再固定使用 `0.5 / 0.5`。
+## 图像归一化与数据检查
 
 当前默认行为：
 
 - `data.normalization.source=auto_train_stats`
-- 自动统计 train split 的灰度图 `mean/std`
+- 首次运行时自动统计 train 集灰度图 `mean/std`
 - 默认缓存到 `dataset/train_mean_std.json`
-- 运行时把实际使用的归一化信息写入：
-  - `image_normalization.json`
-  - `config.json`
-  - `run_config.json`
-  - checkpoint
+- 实际使用的归一化信息会写入每次实验目录的 `image_normalization.json`
 
-如果你要手动指定，可以在配置中写：
+如果你想手动指定：
 
 ```yaml
 data:
@@ -225,201 +256,159 @@ data:
     std: 0.21
 ```
 
-也可以单独运行统计脚本：
-
-```bash
-python compute_train_mean_std.py --image-dir dataset/RHPE_train
-```
-
-## 9. 训练入口与主流程
-
-主训练入口：
-
-```bash
-python scripts/train.py --config configs/default.yaml
-```
-
-真实调用链：
+数据索引是严格匹配的：
 
 ```text
-scripts/train.py
--> src/rhpe_boneage/training/runner.py:train_main
--> 数据发现 / 数据集构建 / 模型构建 / 训练 / best checkpoint / 最终 val/test / 报告生成
+ID -> image_path -> csv_row -> roi_annotation
 ```
 
-训练开始时会打印 `CONFIG SUMMARY`，至少包含：
+检查项包括：
 
-- model type
-- metadata mode
-- input modalities
-- target type
-- dataset size
-- device
+- 缺失图像
+- 缺失 CSV 记录
+- 缺失 ROI 标注
+- 重复 CSV ID
+- 重复图像 ID
+- 重复 ROI ID
+- 图像不可读
+- 图像名与标准化 ID 不匹配
 
-## 10. 常用命令
+其中重复 ROI 会直接报错，避免把不可信标注带进训练。
 
-### 标准训练
+## 输出目录
 
-```bash
-python scripts/train.py --config configs/default.yaml
-```
-
-### 更贴近 SIMBA 的配置声明
-
-```bash
-python scripts/train.py \
-  --config configs/default.yaml \
-  --set experiment.mode=simba \
-  --set model.metadata.mode=simba_hybrid
-```
-
-### 更强调 ROI / local branch 的配置声明
-
-```bash
-python scripts/train.py \
-  --config configs/default.yaml \
-  --set experiment.mode=bonet_like
-```
-
-### 断点续训
-
-```bash
-python scripts/train.py \
-  --config configs/default.yaml \
-  --set training.resume_checkpoint=outputs/xxx/model/last_checkpoint.pt
-```
-
-续训时会在构建 dataset 之前先恢复 checkpoint 中保存的配置与归一化信息，避免续训前后数据处理不一致。
-
-### 验证
-
-```bash
-python scripts/validate.py --checkpoint outputs/xxx/model/best_model.pt
-```
-
-### 测试
-
-```bash
-python scripts/test.py --checkpoint outputs/xxx/model/best_model.pt
-```
-
-### 推理
-
-```bash
-python scripts/infer.py --checkpoint outputs/xxx/model/best_model.pt
-```
-
-## 11. 输出目录结构
-
-每次训练会生成一个独立目录，结构如下：
+每次运行都会创建独立目录，命名规则为：
 
 ```text
-outputs/
-  exp_xxx/
-    config.yaml
-    config.json
-    run_config.json
-    effective_params.json
-    config_summary.json
-    runtime.json
-    dataset_report.json
-    dataset_summary.json
-    dataloader.json
-    image_normalization.json
-    history.csv
-    val_predictions.csv
-    val_metrics.json
-    test_predictions.csv
-    test_metrics.json
-    metrics.json
-    best_metrics.json
-    metrics_summary.csv
-    run.log
-    model/
-      best_model.pt
-      last_checkpoint.pt
-    plots/
-      curves.png
-      loss_curve.png
-      mae_curve.png
-      mad_curve.png
-      val_scatter.png
-      val_residual.png
-      error_histogram_val.png
-      ...
+outputs/{experiment.name}_{purpose}_{YYYYMMDD_HHMMSS}
 ```
 
-`metrics.json` / `best_metrics.json` 中会汇总：
+其中 `purpose` 可能是：
 
-- `loss`
-- `final_mae`
-- `final_mad`
-- `relative_mae`
-- `relative_mad`
-- `relative_age_error_corr`
-- `relative_age_error_slope`
+- `train`
+- `val`
+- `test`
+- `optuna`
+- `trial`
 
-如果 test 集没有 `Boneage` 真值，会自动退化为只导出预测和预测分布图。
+训练目录的典型结构：
 
-## 12. 配置与文档一致性约定
+```text
+outputs/exp_xxx/
+  config.yaml
+  config.json
+  run_config.json
+  effective_params.json
+  config_summary.json
+  runtime.json
+  dataset_report.json
+  dataset_summary.json
+  dataloader.json
+  image_normalization.json
+  history.csv
+  val_predictions.csv
+  val_metrics.json
+  test_predictions.csv
+  test_metrics.json
+  metrics.json
+  best_metrics.json
+  metrics_summary.csv
+  run.log
+  model/
+    best_model.pt
+    last_checkpoint.pt
+  plots/
+    curves.png
+    loss_curve.png
+    mae_curve.png
+    mad_curve.png
+    val_scatter.png
+    val_residual.png
+    error_histogram_val.png
+    ...
+```
 
-当前仓库采用以下约定：
+说明：
 
-- 文档描述必须以默认配置真实行为为准
-- `experiment.mode` 用于声明方法关系和实验定位，不隐藏地改模型
-- `model.metadata.mode` 真实决定 metadata 分支实现
-- `model.target_mode` 真实决定训练目标
-- `run_config.json` 与 `effective_params.json` 记录当次实验的实际运行配置
+- `config_summary.json`：从当前配置推导出的简明结构摘要
+- `effective_params.json`：实际生效的关键参数、运行设备与 DataLoader 参数
+- `metrics_summary.csv`：每个 epoch 的历史 + 额外一行 `best_model`
+- `best_metrics.json`：最佳 checkpoint 的摘要
+- `metrics.json`：训练入口下与 `best_metrics.json` 同步；评估入口下则是当前 split 的指标
+- `run.log`：完整训练/评估日志
 
-因此当前默认结论是：
+## test 集没有真值时会发生什么
 
-- 默认 metadata 模式是 `mlp`
-- `simba_multiplier` / `simba_hybrid` 是可选模式
-- 默认目标是 `relative bone age`
-- 当前项目是“受论文启发并工程实现”的版本，不是论文原始代码复现
+当前 RHPE test CSV 不包含 `Boneage`，所以：
 
-## 13. 目录职责
+- 可以输出预测结果
+- 不能计算 test `loss / MAE / MAD`
+- 不能生成 `test_scatter.png`、`test_residual.png`、`error_histogram_test.png`
 
-主流程文件：
+系统会自动退化为输出：
 
-- [configs/default.yaml](/home/lqw/DLBBAP/configs/default.yaml)
-- [scripts/train.py](/home/lqw/DLBBAP/scripts/train.py)
-- [scripts/validate.py](/home/lqw/DLBBAP/scripts/validate.py)
-- [scripts/test.py](/home/lqw/DLBBAP/scripts/test.py)
-- [scripts/infer.py](/home/lqw/DLBBAP/scripts/infer.py)
-- [src/rhpe_boneage/data](/home/lqw/DLBBAP/src/rhpe_boneage/data)
-- [src/rhpe_boneage/models](/home/lqw/DLBBAP/src/rhpe_boneage/models)
-- [src/rhpe_boneage/training](/home/lqw/DLBBAP/src/rhpe_boneage/training)
+- `test_predictions.csv`
+- `plots/test_prediction_histogram.png`
+- `test_prediction_summary.json`
+- `test_report_note.txt`
 
-辅助工具：
+## UI 能力
 
-- [scripts/train_ui.py](/home/lqw/DLBBAP/scripts/train_ui.py)
-- [scripts/inspect_dataset.py](/home/lqw/DLBBAP/scripts/inspect_dataset.py)
-- [scripts/tune.py](/home/lqw/DLBBAP/scripts/tune.py)
-- [compute_train_mean_std.py](/home/lqw/DLBBAP/compute_train_mean_std.py)
+`scripts/train_ui.py` 是一个基于 Tk 的训练界面，当前支持：
 
-参考代码：
+- 读取并编辑配置
+- 中英文界面切换
+- 选择 resume checkpoint
+- 保存修改后的 YAML
+- 启动训练
+- 通过 `TrainingControl` 请求优雅停止
 
-- [SIMBA](/home/lqw/DLBBAP/SIMBA)
-- [Bonet-master](/home/lqw/DLBBAP/Bonet-master)
+UI 里展示的是“可见字段”，默认会把主实验参数暴露出来，隐藏一部分工程/调试项。
 
-## 14. 环境与运行信息
+## 参考代码的边界
 
-依赖清单见 [requirements.txt](/home/lqw/DLBBAP/requirements.txt)。
+仓库中的：
 
-具体运行环境不要以 README 中的静态文字为准，应以每次运行自动写出的：
+- `SIMBA/`
+- `Bonet-master/`
 
-- `runtime.json`
-- `run.log`
+保留的是论文参考代码快照。它们仍然是旧的、以 Horovod 为中心的独立训练脚本，不属于当前主工程运行链路。当前工程只是吸收了其中的部分思路，例如：
 
-为准。
+- `SIMBA`：relative target、identity markers、metadata multiplier/hybrid
+- `BoNet`：ROI、keypoints、heatmap、局部信息利用
 
-## 15. 论文写作建议
+更准确的表述应该是：
 
-如果要直接用于论文写作，推荐这样表述：
+- 当前项目受 `SIMBA` 启发，但不是 `SIMBA` 原始代码复现
+- 当前项目受 `BoNet` 启发，但不是 `BoNet` 原始代码复现
 
-- 方法章节：描述这是一个融合 `SIMBA` 与 `BoNet` 思想的工程化多模态骨龄回归框架
-- 实验章节：把 `experiment.mode`、`model.metadata.mode`、`model.target_mode`、`branch_mode` 作为消融轴
-- 复现实验：以 `run_config.json` 和 `effective_params.json` 为准
+## 仓库内已保留的示例输出
 
-这样可以避免“我以为在做 A，实际跑的是 B”的描述偏差。
+下面这些结果来自当前仓库里已经存在的本地输出目录，适合用来对照 README 与产物格式；它们不是论文级 benchmark 声明：
+
+- `outputs/rhpe_boneage_bonet_master_like_train_20260412_143827`：最佳验证 `MAE=8.1825`，`MAD=6.2985`
+- `outputs/rhpe_boneage_simba_like_train_20260412_180421`：最佳验证 `MAE=9.9712`，`MAD=7.6779`
+- `outputs/merged_90-8-no1-Bonet-master_like_train_20260410`：历史合并产物，最佳验证 `MAE=9.7740`，`MAD=7.0000`
+
+注意：
+
+- `merged_*` 目录是历史保留产物，当前主工程代码里没有对应的自动合并脚本入口。
+- 如果你要报告实验结果，应优先以每次运行目录中的 `best_metrics.json`、`metrics_summary.csv`、`run_config.json` 为准。
+
+## 已知限制
+
+- 当前 test split 没有骨龄真值，只能做预测导出，不能做最终 test 指标评估。
+- 当前主工程默认面向 RHPE 风格目录和字段命名，不是通用任意骨龄数据集适配器。
+- `configs/Bonet-master_like.yaml` 与 `configs/simba_like.yaml` 是“论文风格基线”，不是对原论文网络和训练流程的严格复现。
+- 参考目录 `SIMBA/` 和 `Bonet-master/` 依赖的旧环境与当前 `requirements.txt` 不完全一致，不建议与主工程混用。
+
+## 建议的论文/报告表述
+
+如果你要基于这个仓库写论文或实验报告，推荐写法：
+
+- 方法：一个融合 SIMBA 与 BoNet 思想的工程化多模态骨龄回归框架
+- 主实验：以 `configs/default.yaml` 或你自己的 overlay 为主
+- 消融轴：`target_mode`、`metadata.mode`、`branch_mode`、`ensemble_mode`
+- 复现实验依据：`config.yaml`、`run_config.json`、`effective_params.json`、`best_metrics.json`
+
+这样可以避免把“实验声明模式”误写成“模型自动切换”。
