@@ -1,0 +1,10 @@
+{
+  "note": "当前 test 集缺少 Boneage 真值列，因此无法计算 test loss/MAE/MAD，也无法生成 plots/test_scatter.png、plots/test_residual.png 和 plots/error_histogram_test.png。系统已自动改为输出 plots/test_prediction_histogram.png 与 test_prediction_summary.json。",
+  "prediction_summary": {
+    "sample_count": 79,
+    "pred_mean": 121.1704256081883,
+    "pred_std": 40.367081140899664,
+    "pred_min": 26.072265625,
+    "pred_max": 200.134765625
+  }
+}
