@@ -1,9 +1,10 @@
 experiment:
   name: rhpe_boneage_simba_like
   mode: simba
+  seed: 1111
 
 runtime:
-  allow_cpu_fallback: true
+  allow_cpu_fallback: false
   channels_last: false
 
 data:
@@ -20,11 +21,15 @@ data:
 
 model:
   ensemble_mode: resnet
+  pretrained: false
   branch_mode: global_only
   target_mode: relative
-  relative_target_direction: boneage_minus_chronological
+  relative_target_direction: chronological_minus_boneage
+  global_dim: 1000
   cbam:
     enabled: false
+    global_branch: false
+    local_branch: false
   metadata:
     enabled: true
     mode: simba_multiplier
@@ -32,6 +37,9 @@ model:
     use_chronological: true
   heatmap_guidance:
     enabled: true
+  head:
+    hidden_dim: 1000
+    dropout: 0.0
 
 augmentation:
   affine_p: 1.0
@@ -46,11 +54,11 @@ augmentation:
 
 training:
   epochs: 150
-  batch_size: 17
+  batch_size: 20
   val_batch_size: 1
   test_batch_size: 1
   optimizer: adam
-  lr: 0.001
+  lr: 1.0e-4
   weight_decay: 0.0
   scheduler: plateau
   scheduler_factor: 0.8
@@ -68,7 +76,7 @@ training:
   save_interval: 1
   early_stopping_patience: 0
   early_stopping_min_delta: 0.0
-  workers_override: 4
+  workers_override: 25
   prefetch_factor: 2
   persistent_workers: true
   pin_memory: true
